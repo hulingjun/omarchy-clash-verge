@@ -46,6 +46,17 @@ widget:
 omarchy plugin add https://github.com/jackzasian/omarchy-clash-verge.git --enable
 ```
 
+## Remove
+
+```bash
+omarchy plugin remove jackzasian.clash-verge
+```
+
+Removal only deletes the plugin's own directory under
+`~/.config/omarchy/plugins/` and its entry in `~/.config/omarchy/shell.json`.
+It never touches Clash Verge itself or its configuration — the widget only
+ever talked to Clash Verge's API, never to its config files.
+
 ## Settings
 
 | Setting | Default | Description |
