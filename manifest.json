@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "id": "jackzasian.clash-verge",
+  "name": "Clash Verge",
+  "version": "1.0.0",
+  "author": "jackzasian",
+  "license": "MIT",
+  "description": "Clash Verge proxy status and node switching in the Omarchy bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Clash Verge",
+    "description": "Shows the active outbound node and mode from Clash Verge's local API, and switches nodes or toggles global/rule mode from the bar.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 15,
+      "selectorGroup": "主代理"
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 5,
+        "max": 600,
+        "step": 5,
+        "defaultValue": 15
+      },
+      {
+        "key": "selectorGroup",
+        "type": "string",
+        "label": "Selector group name",
+        "defaultValue": "主代理",
+        "description": "The proxy group in your Clash config that picks the outbound node (Clash Verge's default profile calls this GLOBAL; many custom configs, including this default, name their main selector something else). Falls back to GLOBAL automatically if this name isn't found."
+      }
+    ]
+  }
+}
