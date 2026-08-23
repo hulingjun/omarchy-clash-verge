@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "jackzasian.clash-verge",
   "name": "Clash Verge",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "jackzasian",
   "license": "MIT",
-  "description": "Clash Verge proxy status and node switching in the Omarchy bar.",
+  "description": "Clash Verge proxy status, node switching, latency testing and traffic in the Omarchy bar.",
   "kinds": [
     "bar-widget"
   ],
@@ -14,13 +14,18 @@
   },
   "barWidget": {
     "displayName": "Clash Verge",
-    "description": "Shows the active outbound node and mode from Clash Verge's local API, and switches nodes or toggles global/rule mode from the bar.",
+    "description": "Shows the active outbound node, mode and throughput from Clash Verge's local API, and switches nodes, groups, latency-tests and toggles rule/global/TUN from the bar.",
     "category": "Network",
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {
       "refreshIntervalSec": 15,
-      "selectorGroup": "主代理"
+      "selectorGroup": "主代理",
+      "barLabel": "Icon",
+      "sortMode": "Config",
+      "socketPath": "",
+      "controllerUrl": "",
+      "secret": ""
     },
     "schema": [
       {
@@ -30,14 +35,52 @@
         "min": 5,
         "max": 600,
         "step": 5,
-        "defaultValue": 15
+        "defaultValue": 15,
+        "description": "How often the closed widget re-polls. While the panel is open it refreshes every 2 seconds so throughput reads live."
       },
       {
         "key": "selectorGroup",
         "type": "string",
-        "label": "Selector group name",
+        "label": "Default group",
         "defaultValue": "主代理",
-        "description": "The proxy group in your Clash config that picks the outbound node (Clash Verge's default profile calls this GLOBAL; many custom configs, including this default, name their main selector something else). Falls back to GLOBAL automatically if this name isn't found."
+        "description": "The proxy group the widget steers when it opens. Every other group in your config is one pick away in the panel's group dropdown, so this is only the starting point. Falls back to GLOBAL if this name isn't in your config."
+      },
+      {
+        "key": "barLabel",
+        "type": "enum",
+        "label": "Bar label",
+        "options": ["Icon", "Node", "Speed"],
+        "defaultValue": "Icon",
+        "description": "Icon shows the shield alone. Node adds the active outbound node's name. Speed shows live up/down throughput, which also makes the widget poll /connections while closed."
+      },
+      {
+        "key": "sortMode",
+        "type": "enum",
+        "label": "Node order",
+        "options": ["Config", "Latency", "Name"],
+        "defaultValue": "Config",
+        "description": "How the node list is sorted when the panel opens. Press s in the panel to cycle it without changing this."
+      },
+      {
+        "key": "socketPath",
+        "type": "path",
+        "label": "API socket path",
+        "defaultValue": "",
+        "description": "Leave empty for Clash Verge's default, /tmp/verge/verge-mihomo.sock. Only set this if you moved it."
+      },
+      {
+        "key": "controllerUrl",
+        "type": "string",
+        "label": "External controller URL",
+        "defaultValue": "",
+        "description": "Leave empty to use the unix socket. Set to something like http://127.0.0.1:9097 to talk to a mihomo core over TCP instead — useful when running the core directly rather than through Clash Verge."
+      },
+      {
+        "key": "secret",
+        "type": "string",
+        "label": "API secret",
+        "defaultValue": "",
+        "description": "Only needed when the external controller above has a secret set. Stored in plain text in shell.json, like every other shell setting — leave empty when using the unix socket, which needs no secret."
       }
     ]
   }

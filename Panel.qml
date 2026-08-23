@@ -8,21 +8,29 @@ import qs.Ui
 import "model/Shared.js" as Shared
 import "model/Clash.js" as Clash
 
-// Clash Verge status and node switching. One provider, so unlike
-// jkoestinger/omarchy-vpn's multi-backend VpnController this talks to the API
-// directly rather than through a backend-contract abstraction meant for
-// choosing among several interchangeable tools — see model/Clash.js's header
-// comment for why treating Clash as VPN-exclusive would be the wrong model
-// even if it were wired in as a backend there.
+// Clash Verge status, node switching, latency testing and traffic. One
+// provider, so unlike jkoestinger/omarchy-vpn's multi-backend VpnController
+// this talks to the API directly rather than through a backend-contract
+// abstraction meant for choosing among several interchangeable tools — see
+// model/Clash.js's header comment for why treating Clash as VPN-exclusive
+// would be the wrong model even if it were wired in as a backend there.
 Panel {
   id: root
   moduleName: "jackzasian.clash-verge"
   ipcTarget: "jackzasian.clash-verge"
+  // The base Panel's own IpcHandler only knows open/close/toggle. This widget
+  // registers those plus the node/mode/group verbs below on the same target,
+  // so a Hyprland bind can flip the proxy without opening anything.
+  manageIpc: false
 
   readonly property color fg: root.bar ? root.bar.foreground : Color.foreground
   readonly property color dim: Qt.darker(fg, 1.45)
   readonly property string fontFamily: root.bar ? root.bar.fontFamily : "JetBrainsMono Nerd Font"
+  readonly property color okColor: "#22c55e"
+  readonly property color badColor: "#ef4444"
+  readonly property color warnColor: "#f59e0b"
 
+  // ── Settings ──────────────────────────────────────────────────────────────
   readonly property int refreshInterval: {
     var v = settings ? settings.refreshIntervalSec : undefined
     var n = typeof v === "number" ? v : parseInt(String(v), 10)
@@ -33,27 +41,57 @@ Panel {
     var s = String(v === undefined || v === null ? "" : v).trim()
     return s !== "" ? s : "主代理"
   }
+  readonly property string barLabelMode: {
+    var s = String(root.setting("barLabel", "icon")).trim().toLowerCase()
+    return Clash.BAR_LABEL_MODES.indexOf(s) !== -1 ? s : "icon"
+  }
+  readonly property string defaultSortMode: {
+    var s = String(root.setting("sortMode", "config")).trim().toLowerCase()
+    return Clash.SORT_MODES.indexOf(s) !== -1 ? s : "config"
+  }
+  readonly property var api: Clash.apiConfig(root.setting("socketPath", ""),
+                                             root.setting("controllerUrl", ""),
+                                             root.setting("secret", ""))
 
+  // ── Live state ────────────────────────────────────────────────────────────
   property bool reachable: false
   property bool loaded: false
-  property var configsInfo: ({ loaded: false, mode: "" })
-  property var resolved: null // { groupName, group: { now, all } }
-  property var proxyTypes: ({})
+  property var configsInfo: ({ loaded: false, mode: "", tun: false })
+  property var resolved: null            // { groupName, group: { now, all, type, fixed } }
+  property var nodes: ({})               // name -> node, from the deep poll
+  property var groupChoices: []          // every group the picker can offer
+  property var netSample: ({ loaded: false })
+  property var rates: ({ known: false })
+  property var providers: []
   property string filter: ""
-  property string lastError: ""
+  property string sortMode: root.defaultSortMode
+  property string groupOverride: ""      // set by the picker, beats the setting
+  property string statusError: ""        // connectivity, owned by the poll
+  property string lastError: ""          // an action that failed, cleared on a timer
   property string actionStatus: ""
+  property int cursorIndex: -1
+  property bool testing: false
+  property double providersFetchedAt: 0
+
   // -1 follows the daemon; 0/1 overrides it while a switch/mode change is in
   // flight, so the UI does not wait a poll cycle to react to its own click.
   property int _desiredConnected: -1
   property string _pendingKey: ""
   property var _pendingToggles: ({})
 
+  readonly property string requestedGroup: root.groupOverride !== "" ? root.groupOverride : root.selectorGroupName
+  readonly property string activeGroupName: root.resolved ? root.resolved.groupName : root.requestedGroup
+
   readonly property var state: ({
     reachable: root.reachable,
-    selector: root.resolved ? root.resolved.group : null,
-    groupName: root.resolved ? root.resolved.groupName : "",
     mode: root.configsInfo.mode,
-    proxyTypes: root.proxyTypes
+    tun: root.configsInfo.tun,
+    groupName: root.activeGroupName,
+    group: root.resolved ? root.resolved.group : null,
+    nodes: root.nodes,
+    net: root.netSample,
+    rates: root.rates,
+    providers: root.providers
   })
 
   readonly property bool connected: {
@@ -62,13 +100,36 @@ Panel {
   }
   readonly property string summary: Clash.clashSummary(root.state)
   readonly property var details: Clash.clashDetails(root.state)
+  readonly property var networkRows: Clash.clashNetworkRows(root.state)
   readonly property var toggles: applyPendingToggles(Clash.clashToggles(root.state), root._pendingToggles)
   readonly property string currentKey: Clash.clashCurrentKey(root.state)
-  readonly property var targets: Clash.clashTargets(root.state, root.filter)
+  readonly property var targets: Clash.clashTargets(root.state, root.filter, root.sortMode)
+  readonly property var subscriptions: Clash.subscriptionRows(root.providers, root.nowMillis)
+  readonly property string visibleError: root.lastError !== "" ? root.lastError : root.statusError
   readonly property string emptyText: !root.loaded
     ? "Checking…"
-    : (root.reachable ? (root.resolved ? "No proxies match." : "Selector group \"" + root.selectorGroupName + "\" and GLOBAL both missing.") : "Clash Verge isn't running.")
-  readonly property string barIcon: Shared.GLYPH_SHIELD
+    : (root.reachable
+        ? (root.resolved ? "No proxies match." : "Group \"" + root.requestedGroup + "\" and GLOBAL both missing.")
+        : "Clash Verge isn't running.")
+
+  // Re-read once per poll rather than on every binding evaluation, so the
+  // "3h ago" style strings do not force a repaint whenever anything else in
+  // the panel changes.
+  property double nowMillis: Date.now()
+
+  readonly property string barGlyph: Clash.barGlyph(root.state)
+  readonly property string barText: {
+    var label = Clash.barLabel(root.state, root.barLabelMode)
+    return label === "" ? root.barGlyph : root.barGlyph + "  " + label
+  }
+  readonly property color barColor: {
+    switch (Clash.barState(root.state)) {
+      case "down": return root.bar ? root.bar.urgent : Color.urgent
+      case "direct": return root.dim
+      case "global": return Color.accent
+      default: return root.fg
+    }
+  }
 
   function applyPendingToggles(list, pending) {
     var keys = Object.keys(pending || {})
@@ -79,10 +140,29 @@ Panel {
     })
   }
 
+  // ── Polling ───────────────────────────────────────────────────────────────
+  // A closed panel polls only /configs plus the active group (~3.5 KB), and
+  // adds /connections just when the bar is showing throughput. An open one
+  // beats every 2 seconds so throughput reads live — but the ~74 KB proxy dump
+  // behind the node list carries only types and latencies, which do not move
+  // on that timescale, so re-fetching and re-parsing it thirty times a minute
+  // would be most of the widget's cost for none of its value. It is fetched at
+  // most every 9 seconds, and immediately whenever the list itself is stale.
+  property double lastDeepAt: 0
+
   function refresh() {
     if (statusProc.running) return
+    var now = Date.now()
+    var deep = root.opened && (now - root.lastDeepAt >= 9000)
+    var withTraffic = root.opened || root.barLabelMode === "speed"
+    if (deep) root.lastDeepAt = now
+    statusProc.command = Clash.buildStatusCommand(root.api, root.requestedGroup, deep, withTraffic)
     statusProc.running = true
   }
+
+  // Forces the next refresh() to take the deep path — used when the panel
+  // opens or the group changes, where a stale node list is the whole problem.
+  function invalidateDeep() { root.lastDeepAt = 0 }
 
   function triggerPress(button) {
     if (button === Qt.MiddleButton) { refresh(); return }
@@ -90,23 +170,48 @@ Panel {
     else { open(); refresh() }
   }
 
-  // encodeURIComponent output is limited to unreserved characters plus
-  // %-triplets (RFC 3986) — no spaces, quotes, semicolons or backticks — so
-  // interpolating it into the bash -c string below carries no injection risk
-  // regardless of what the proxy name contains.
-  function encodedGroup() {
-    return encodeURIComponent(root.selectorGroupName)
+  function setError(message) {
+    root.lastError = String(message || "")
+    if (root.lastError !== "") errorTimer.restart()
   }
 
-  function applyStatus(configsRaw, configuredRaw, globalRaw, proxiesRaw) {
+  function clearError() {
+    root.lastError = ""
+    errorTimer.stop()
+  }
+
+  function applyStatus(parts) {
     root.loaded = true
-    var configs = Clash.parseClashConfigs(configsRaw)
-    var resolvedGroup = Clash.resolveSelector(configuredRaw, globalRaw, root.selectorGroupName)
+    root.nowMillis = Date.now()
+
+    var configs = Clash.parseClashConfigs(Clash.batchSlot(parts, Clash.SLOT_CONFIGS))
+    var resolvedGroup = Clash.resolveSelector(Clash.batchSlot(parts, Clash.SLOT_GROUP),
+                                              Clash.batchSlot(parts, Clash.SLOT_GLOBAL),
+                                              root.requestedGroup)
     root.reachable = configs.loaded || resolvedGroup !== null
     root.configsInfo = configs
     root.resolved = resolvedGroup
-    root.proxyTypes = Clash.parseProxyTypes(proxiesRaw)
-    root.lastError = ""
+
+    // curl's exit code separates "Clash Verge isn't running" from "the socket
+    // is there but refused us" or "the endpoint setting is wrong" — v1.0.0
+    // collapsed all three into the first message.
+    var rc = Clash.parseExitCode(Clash.batchSlot(parts, Clash.SLOT_RC))
+    root.statusError = root.reachable ? "" : Clash.describeCurlError(rc, root.api)
+
+    // The deep slots are empty on a shallow poll; keeping the last dump is
+    // better than blanking every row's type and latency between opens.
+    var proxies = Clash.parseProxies(Clash.batchSlot(parts, Clash.SLOT_PROXIES))
+    if (proxies.loaded) {
+      root.nodes = proxies.nodes
+      root.groupChoices = Clash.selectableGroups(proxies, root.activeGroupName)
+    }
+
+    var net = Clash.parseConnections(Clash.batchSlot(parts, Clash.SLOT_CONNECTIONS))
+    if (net.loaded) {
+      net.at = root.nowMillis
+      root.rates = Clash.computeRates(root.netSample, net)
+      root.netSample = net
+    }
 
     if (root._desiredConnected !== -1) {
       var real = root.reachable && configs.mode !== "" && configs.mode !== "direct"
@@ -116,25 +221,52 @@ Panel {
     var stillPending = {}
     var changed = false
     for (var key in root._pendingToggles) {
-      if (key === "global" && configs.loaded && (configs.mode === "global") === root._pendingToggles[key]) changed = true
-      else stillPending[key] = root._pendingToggles[key]
+      var want = root._pendingToggles[key]
+      var settled = configs.loaded
+        && ((key === "global" && (configs.mode === "global") === want)
+         || (key === "tun" && configs.tun === want))
+      if (settled) changed = true
+      else stillPending[key] = want
     }
     if (changed) root._pendingToggles = stillPending
   }
 
+  // ── Actions ───────────────────────────────────────────────────────────────
+  function httpCommand(method, path, body) {
+    var args = ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "8"]
+      .concat(Clash.curlArgs(root.api))
+      .concat(["-X", method, Clash.apiUrl(root.api, path)])
+    if (body !== undefined && body !== null) {
+      args = args.concat(["-H", "Content-Type: application/json", "-d", JSON.stringify(body)])
+    }
+    return args
+  }
+
+  function getCommand(path, timeoutSeconds) {
+    return ["curl", "-s", "--max-time", String(timeoutSeconds)]
+      .concat(Clash.curlArgs(root.api))
+      .concat([Clash.apiUrl(root.api, path)])
+  }
+
+  function groupPath(suffix) {
+    return "/proxies/" + encodeURIComponent(root.activeGroupName) + (suffix || "")
+  }
+
   function connectTo(target) {
     if (!root.reachable || !root.resolved || !target || selectProc.running) return
-    root.lastError = ""
-    root._desiredConnected = 1
+    clearError()
     root._pendingKey = target.key
-    root.actionStatus = "Switching to " + target.label + "…"
-    selectProc.command = [
-      "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-      "--unix-socket", Clash.SOCK_PATH,
-      "-X", "PUT", "http://localhost/proxies/" + root.encodedGroup(),
-      "-H", "Content-Type: application/json",
-      "-d", JSON.stringify({ name: target.key })
-    ]
+
+    // An auto group's rows are pins, not selections: PUT records a `fixed`
+    // override and DELETE hands the choice back to the group's own probing.
+    if (target.isAuto) {
+      root.actionStatus = "Handing back to " + root.resolved.group.type + "…"
+      selectProc.command = httpCommand("DELETE", groupPath(), null)
+    } else {
+      root._desiredConnected = 1
+      root.actionStatus = (Clash.isAutoGroupType(root.resolved.group.type) ? "Pinning " : "Switching to ") + target.label + "…"
+      selectProc.command = httpCommand("PUT", groupPath(), { name: target.key })
+    }
     selectProc.running = true
   }
 
@@ -147,31 +279,108 @@ Panel {
 
   function setMode(mode) {
     if (modeProc.running) return
-    root.lastError = ""
+    clearError()
     root._desiredConnected = mode === "direct" ? 0 : 1
     root.actionStatus = mode === "direct" ? "Bypassing…" : "Restoring proxy…"
-    modeProc.command = [
-      "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-      "--unix-socket", Clash.SOCK_PATH,
-      "-X", "PATCH", "http://localhost/configs",
-      "-H", "Content-Type: application/json",
-      "-d", JSON.stringify({ mode: mode })
-    ]
+    modeProc.command = httpCommand("PATCH", "/configs", { mode: mode })
+    modeProc.running = true
+  }
+
+  function setTun(enabled) {
+    if (modeProc.running) return
+    clearError()
+    root.actionStatus = enabled ? "Enabling TUN…" : "Disabling TUN…"
+    modeProc.command = httpCommand("PATCH", "/configs", { tun: { enable: enabled === true } })
     modeProc.running = true
   }
 
   function setToggle(key, value) {
-    if (key !== "global" || modeProc.running) return
+    if (modeProc.running) return
+    if (key !== "global" && key !== "tun") return
     var pending = {}
     for (var name in root._pendingToggles) pending[name] = root._pendingToggles[name]
     pending[key] = value
     root._pendingToggles = pending
-    setMode(value ? "global" : "rule")
+    if (key === "global") setMode(value ? "global" : "rule")
+    else setTun(value)
+  }
+
+  function selectGroup(name) {
+    if (String(name || "") === "" || name === root.activeGroupName) return
+    root.groupOverride = String(name)
+    root.cursorIndex = -1
+    clearError()
+    invalidateDeep()
+    refresh()
+  }
+
+  function cycleSort() {
+    var i = Clash.SORT_MODES.indexOf(root.sortMode)
+    root.sortMode = Clash.SORT_MODES[(i + 1) % Clash.SORT_MODES.length]
+  }
+
+  // One request probes every member of the group. The delays mihomo already
+  // had in its history are what the rows show until this runs.
+  function testAll() {
+    if (testProc.running || !root.resolved) return
+    clearError()
+    root.testing = true
+    root.actionStatus = "Testing " + root.resolved.group.all.length + " nodes…"
+    testProc.probed = root.resolved.group.all.slice()
+    testProc.command = getCommand("/group/" + encodeURIComponent(root.activeGroupName)
+      + "/delay?url=" + encodeURIComponent(Clash.TEST_URL) + "&timeout=3000", 25)
+    testProc.running = true
+  }
+
+  function testNode(name) {
+    if (nodeTestProc.running || String(name || "") === "") return
+    clearError()
+    root.actionStatus = "Testing " + name + "…"
+    nodeTestProc.nodeName = String(name)
+    nodeTestProc.command = getCommand("/proxies/" + encodeURIComponent(name)
+      + "/delay?url=" + encodeURIComponent(Clash.TEST_URL) + "&timeout=3000", 8)
+    nodeTestProc.running = true
+  }
+
+  // ~295 KB on a config with providers, because mihomo inlines every proxy of
+  // every provider into the response. On demand and throttled, never polled.
+  function loadProviders(force) {
+    if (providerProc.running) return
+    if (!force && root.nowMillis - root.providersFetchedAt < 120000) return
+    providerProc.command = getCommand("/providers/proxies", 10)
+    providerProc.running = true
+  }
+
+  function updateProvider(name) {
+    if (providerUpdateProc.running) return
+    clearError()
+    root.actionStatus = "Updating " + name + "…"
+    providerUpdateProc.command = httpCommand("PUT", "/providers/proxies/" + encodeURIComponent(name), null)
+    providerUpdateProc.running = true
+  }
+
+  // ── Keyboard cursor ───────────────────────────────────────────────────────
+  function moveCursor(delta) {
+    var count = root.targets.length
+    if (count === 0) { root.cursorIndex = -1; return }
+    var next = root.cursorIndex + delta
+    if (root.cursorIndex < 0) next = delta > 0 ? 0 : count - 1
+    if (next < 0) next = count - 1
+    if (next >= count) next = 0
+    root.cursorIndex = next
+  }
+
+  function activateCursor() {
+    if (root.cursorIndex < 0 || root.cursorIndex >= root.targets.length) return
+    connectTo(root.targets[root.cursorIndex])
   }
 
   onOpenedChanged: {
     if (opened) {
+      root.cursorIndex = -1
+      invalidateDeep()
       refresh()
+      loadProviders(false)
     } else {
       // Cleared imperatively, and the field's text along with it: a
       // declarative `text: root.filter` binding would be severed the moment
@@ -180,6 +389,7 @@ Panel {
       // leave the field showing stale text the next time the panel opens.
       root.filter = ""
       filterField.text = ""
+      root.cursorIndex = -1
     }
   }
 
@@ -188,30 +398,45 @@ Panel {
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
+  // ── IPC ───────────────────────────────────────────────────────────────────
+  // `omarchy-shell jackzasian.clash-verge bypass`, and friends. The point is
+  // Hyprland binds: flipping the proxy should not require the panel.
+  IpcHandler {
+    target: root.ipcTarget
+
+    function open(): void { root.open() }
+    function close(): void { root.close() }
+    function show(): void { root.open() }
+    function hide(): void { root.close() }
+    function toggle(): void { root.toggle() }
+    function status(): string { return root.summary }
+    function refreshNow(): void { root.refresh() }
+    function bypass(): void { root.setMode("direct") }
+    function restore(): void { root.setMode("rule") }
+    function toggleProxy(): void { root.toggleConnection() }
+    function mode(name: string): void {
+      var m = String(name || "").toLowerCase()
+      if (m === "rule" || m === "global" || m === "direct") root.setMode(m)
+    }
+    function tun(enabled: string): void { root.setTun(String(enabled) === "true") }
+    function select(name: string): void {
+      root.connectTo({ key: String(name), label: String(name), isAuto: false })
+    }
+    function auto(): void {
+      root.connectTo({ key: Clash.AUTO_KEY, label: "Automatic", isAuto: true })
+    }
+    function group(name: string): void { root.selectGroup(String(name)) }
+    function test(): void { root.testAll() }
+  }
+
+  // ── Processes ─────────────────────────────────────────────────────────────
   Process {
     id: statusProc
-    // One process, four requests over the local unix socket — cheap, and it
-    // keeps the four answers from the same instant rather than racing four
-    // separate polls against a mode or selection that could change between
-    // them. GLOBAL is always fetched alongside the configured group so
-    // resolveSelector() can fall back without a second round trip.
-    command: ["bash", "-c",
-      "SOCK='" + Clash.SOCK_PATH + "'; SEP='" + Clash.SEP + "'; " +
-      "curl -s --max-time 4 --unix-socket \"$SOCK\" http://localhost/configs; " +
-      "printf '\\n%s\\n' \"$SEP\"; " +
-      "curl -s --max-time 4 --unix-socket \"$SOCK\" http://localhost/proxies/" + encodedGroup() + "; " +
-      "printf '\\n%s\\n' \"$SEP\"; " +
-      "curl -s --max-time 4 --unix-socket \"$SOCK\" http://localhost/proxies/GLOBAL; " +
-      "printf '\\n%s\\n' \"$SEP\"; " +
-      "curl -s --max-time 4 --unix-socket \"$SOCK\" http://localhost/proxies"]
-    stdout: StdioCollector {
-      id: statusStdout
-      waitForEnd: true
-    }
-    onExited: function(exitCode) {
-      var parts = Clash.splitBatches(String(statusStdout.text || ""))
-      root.applyStatus(parts[0] || "", parts[1] || "", parts[2] || "", parts[3] || "")
-    }
+    // One process, one poll: every request goes out together so the answers
+    // describe the same instant rather than racing each other against a mode
+    // or selection that could change between them.
+    stdout: StdioCollector { id: statusStdout; waitForEnd: true }
+    onExited: root.applyStatus(Clash.splitBatches(String(statusStdout.text || "")))
   }
 
   Process {
@@ -225,9 +450,8 @@ Panel {
       root.actionStatus = ""
       if (code !== "200" && code !== "204") {
         root._desiredConnected = -1
-        root.lastError = "Clash refused that node (HTTP " + (code || "?") + ")"
+        root.setError("Clash refused that node (HTTP " + (code || "?") + ")")
       }
-      actionStatusTimer.restart()
       root.refresh()
     }
   }
@@ -243,18 +467,73 @@ Panel {
       if (code !== "200" && code !== "204") {
         root._desiredConnected = -1
         root._pendingToggles = ({})
-        root.lastError = "Clash refused that mode change (HTTP " + (code || "?") + ")"
+        root.setError("Clash refused that change (HTTP " + (code || "?") + ")")
       }
-      actionStatusTimer.restart()
+      root.refresh()
+    }
+  }
+
+  Process {
+    id: testProc
+    running: false
+    command: []
+    property var probed: []
+    stdout: StdioCollector { id: testStdout; waitForEnd: true }
+    onExited: function(exitCode) {
+      var result = Clash.parseDelayMap(String(testStdout.text || ""))
+      root.testing = false
+      root.actionStatus = ""
+      if (!result.ok) root.setError("Latency test failed: " + result.error)
+      else root.nodes = Clash.mergeDelays(root.nodes, result.delays, testProc.probed)
+    }
+  }
+
+  Process {
+    id: nodeTestProc
+    running: false
+    command: []
+    property string nodeName: ""
+    stdout: StdioCollector { id: nodeTestStdout; waitForEnd: true }
+    onExited: function(exitCode) {
+      var result = Clash.parseSingleDelay(String(nodeTestStdout.text || ""))
+      root.actionStatus = ""
+      var delays = {}
+      if (result.ok) delays[nodeTestProc.nodeName] = result.delay
+      root.nodes = Clash.mergeDelays(root.nodes, delays, [nodeTestProc.nodeName])
+      if (!result.ok) root.setError(nodeTestProc.nodeName + ": " + result.error)
+    }
+  }
+
+  Process {
+    id: providerProc
+    running: false
+    command: []
+    stdout: StdioCollector { id: providerStdout; waitForEnd: true }
+    onExited: function(exitCode) {
+      root.providers = Clash.parseProviders(String(providerStdout.text || ""))
+      root.providersFetchedAt = Date.now()
+    }
+  }
+
+  Process {
+    id: providerUpdateProc
+    running: false
+    command: []
+    stdout: StdioCollector { id: providerUpdateStdout; waitForEnd: true }
+    onExited: function(exitCode) {
+      var code = String(providerUpdateStdout.text || "").trim()
+      root.actionStatus = ""
+      if (code !== "200" && code !== "204") root.setError("Provider update failed (HTTP " + (code || "?") + ")")
+      root.loadProviders(true)
       root.refresh()
     }
   }
 
   Timer {
-    id: actionStatusTimer
-    interval: 2600
+    id: errorTimer
+    interval: 6000
     repeat: false
-    onTriggered: root.actionStatus = ""
+    onTriggered: root.lastError = ""
   }
 
   Timer {
@@ -264,14 +543,24 @@ Panel {
     onTriggered: root.refresh()
   }
 
+  // A shorter beat while the panel is open, so throughput reads as a live
+  // figure rather than a 15-second average.
+  Timer {
+    interval: 2000
+    running: root.opened
+    repeat: true
+    onTriggered: root.refresh()
+  }
+
   WidgetButton {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: root.barIcon
-    fixedWidth: root.bar && root.bar.vertical ? -1 : Style.space(27)
+    text: root.barText
+    foreground: root.barColor
+    fixedWidth: (root.bar && root.bar.vertical) || root.barLabelMode !== "icon" ? -1 : Style.space(27)
     fixedHeight: root.bar && root.bar.vertical ? Style.space(26) : -1
-    tooltipText: "Clash Verge: " + root.summary
+    tooltipText: Clash.barTooltip(root.state)
     onPressed: function(b) { root.triggerPress(b) }
   }
 
@@ -282,15 +571,23 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(420))
+    contentWidth: panel.fittedContentWidth(Style.space(440))
     contentHeight: panel.fittedContentHeight(contentColumn.implicitHeight)
 
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
+      // Without this the catcher eats j/k/h/l/x before the filter field ever
+      // sees them, and the search box cannot type half the alphabet.
+      blocked: filterField.activeFocus
       onCloseRequested: root.close()
+      onMoveRequested: function(dx, dy) { if (dy !== 0) root.moveCursor(dy) }
+      onActivateRequested: root.activateCursor()
       onTextKey: function(t) {
         if (t === "r" || t === "R") root.refresh()
+        else if (t === "t" || t === "T") root.testAll()
+        else if (t === "s" || t === "S") root.cycleSort()
+        else if (t === "b" || t === "B") root.toggleConnection()
         else if (t === "/") filterField.forceActiveFocus()
       }
 
@@ -299,7 +596,7 @@ Panel {
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.top: parent.top
-        spacing: Style.space(10)
+        spacing: Style.space(9)
 
         // ── Header ──
         RowLayout {
@@ -307,7 +604,7 @@ Panel {
           spacing: 8
 
           Text {
-            text: root.barIcon + "  Clash Verge"
+            text: root.barGlyph + "  Clash Verge"
             color: root.fg
             font.family: root.fontFamily
             font.pixelSize: Style.font.title
@@ -318,9 +615,22 @@ Panel {
           }
 
           Button {
+            text: root.testing ? "Testing…" : "Test all"
+            enabled: root.reachable && root.resolved !== null && !root.testing
+            opacity: enabled ? 1 : 0.5
+            foreground: root.fg
+            tooltipText: "Probe every node in this group (t)"
+            fontFamily: root.fontFamily
+            fontSize: Style.font.caption
+            horizontalPadding: Style.spacing.controlPaddingX
+            verticalPadding: Style.spacing.controlPaddingY
+            onClicked: root.testAll()
+          }
+
+          Button {
             text: "Refresh"
             foreground: root.fg
-            tooltipText: "Refresh status"
+            tooltipText: "Refresh status (r)"
             fontFamily: root.fontFamily
             fontSize: Style.font.caption
             horizontalPadding: Style.spacing.controlPaddingX
@@ -341,8 +651,8 @@ Panel {
             spacing: Style.space(6)
 
             Text {
-              text: root.connected ? Shared.GLYPH_SHIELD : Shared.GLYPH_SWAP
-              color: root.connected ? "#22c55e" : "#6b7280"
+              text: root.barGlyph
+              color: root.connected ? root.okColor : (root.reachable ? "#6b7280" : root.badColor)
               font.family: root.fontFamily
               font.pixelSize: Style.font.title
               Layout.alignment: Qt.AlignVCenter
@@ -381,7 +691,7 @@ Panel {
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
-                Layout.preferredWidth: Style.space(60)
+                Layout.preferredWidth: Style.space(66)
               }
               Text {
                 text: modelData.value
@@ -394,10 +704,35 @@ Panel {
             }
           }
 
+          Repeater {
+            model: root.networkRows
+            delegate: RowLayout {
+              required property var modelData
+              Layout.fillWidth: true
+              Layout.leftMargin: Style.space(28)
+              spacing: Style.space(6)
+              Text {
+                text: modelData.label
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                Layout.preferredWidth: Style.space(66)
+              }
+              Text {
+                text: modelData.value
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideRight
+                Layout.fillWidth: true
+              }
+            }
+          }
+
           Text {
-            visible: root.lastError !== ""
-            text: root.lastError
-            color: "#ef4444"
+            visible: root.visibleError !== ""
+            text: root.visibleError
+            color: root.badColor
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             Layout.leftMargin: Style.space(28)
@@ -412,7 +747,8 @@ Panel {
             spacing: Style.space(6)
             Button {
               text: root.connected ? "Bypass (direct)" : "Restore proxy"
-              foreground: root.connected ? "#ef4444" : "#22c55e"
+              foreground: root.connected ? root.badColor : root.okColor
+              tooltipText: "Toggle whether Clash routes anything at all (b)"
               fontFamily: root.fontFamily
               fontSize: Style.font.caption
               horizontalPadding: Style.space(8)
@@ -423,6 +759,20 @@ Panel {
         }
 
         PanelSeparator { Layout.fillWidth: true; foreground: root.fg; visible: root.reachable }
+
+        // ── Group picker ──
+        // v1.0.0 could only ever drive the one group named in settings. A real
+        // config has a dozen — this machine's has fifteen — and which one you
+        // want to steer changes with what you are doing.
+        Dropdown {
+          visible: root.groupChoices.length > 1
+          Layout.fillWidth: true
+          label: "Group"
+          value: root.activeGroupName
+          options: root.groupChoices
+          fontFamily: root.fontFamily
+          onChanged: function(v) { root.selectGroup(v) }
+        }
 
         // ── Toggles ──
         Repeater {
@@ -440,18 +790,93 @@ Panel {
           }
         }
 
-        // ── Filter ──
-        TextField {
-          id: filterField
-          visible: root.reachable && root.resolved
+        // ── Subscription ──
+        // Nothing else in the API reports how much of a paid plan is left, and
+        // it is exactly the thing you want to know before switching to the
+        // node that streams 4K.
+        Repeater {
+          model: root.subscriptions
+          delegate: ColumnLayout {
+            required property var modelData
+            Layout.fillWidth: true
+            spacing: Style.space(2)
+
+            RowLayout {
+              Layout.fillWidth: true
+              spacing: Style.space(6)
+              Text {
+                text: modelData.label
+                color: root.fg
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideRight
+                Layout.fillWidth: true
+              }
+              Text {
+                text: modelData.used + " / " + modelData.total
+                  + (modelData.expiry !== "" ? " · " + modelData.expiry : "")
+                color: modelData.ratio > 0.9 ? root.warnColor : root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+              Button {
+                visible: modelData.updatable
+                text: "Update"
+                foreground: root.dim
+                tooltipText: "Re-fetch this subscription" + (modelData.updated !== "" ? " (last: " + modelData.updated + ")" : "")
+                fontFamily: root.fontFamily
+                fontSize: Style.font.caption
+                horizontalPadding: Style.space(6)
+                verticalPadding: Style.space(1)
+                onClicked: root.updateProvider(modelData.key)
+              }
+            }
+
+            Rectangle {
+              Layout.fillWidth: true
+              implicitHeight: Style.space(3)
+              radius: height / 2
+              color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.1)
+              Rectangle {
+                width: parent.width * modelData.ratio
+                height: parent.height
+                radius: parent.radius
+                color: modelData.ratio > 0.9 ? root.warnColor : root.okColor
+              }
+            }
+          }
+        }
+
+        // ── Filter + sort ──
+        RowLayout {
+          visible: root.reachable && root.resolved !== null
           Layout.fillWidth: true
-          placeholderText: "Filter nodes — press / to search"
-          font.family: root.fontFamily
-          // No `text: root.filter` binding — see onOpenedChanged's comment.
-          // This is the one place root.filter is written from the field;
-          // everywhere else that wants it empty sets filterField.text
-          // directly.
-          onTextChanged: root.filter = text
+          spacing: Style.space(6)
+
+          TextField {
+            id: filterField
+            Layout.fillWidth: true
+            placeholderText: "Filter nodes — press / to search"
+            font.family: root.fontFamily
+            // No `text: root.filter` binding — see onOpenedChanged's comment.
+            // This is the one place root.filter is written from the field;
+            // everywhere else that wants it empty sets filterField.text
+            // directly.
+            onTextChanged: { root.filter = text; root.cursorIndex = -1 }
+          }
+
+          ButtonGroup {
+            value: root.sortMode
+            options: [
+              { value: "config", label: "#", tooltip: "Config order" },
+              { value: "latency", label: "ms", tooltip: "Fastest first" },
+              { value: "name", label: "az", tooltip: "By name" }
+            ]
+            foreground: root.fg
+            fontFamily: root.fontFamily
+            fontSize: Style.font.caption
+            onChanged: function(v) { root.sortMode = v }
+          }
         }
 
         // ── Target list ──
@@ -469,10 +894,15 @@ Panel {
           id: targetList
           visible: root.targets.length > 0
           Layout.fillWidth: true
-          implicitHeight: Math.min(targetColumn.implicitHeight, Style.space(400))
+          implicitHeight: Math.min(targetColumn.implicitHeight, Style.space(380))
           contentHeight: targetColumn.implicitHeight
           clip: true
           boundsBehavior: Flickable.StopAtBounds
+
+          function revealRow(itemY, itemH) {
+            if (itemY < contentY) contentY = itemY
+            else if (itemY + itemH > contentY + height) contentY = Math.max(0, itemY + itemH - height)
+          }
 
           ColumnLayout {
             id: targetColumn
@@ -483,20 +913,40 @@ Panel {
               model: root.targets
 
               delegate: BorderSurface {
+                id: rowSurface
                 required property var modelData
+                required property int index
                 Layout.fillWidth: true
                 readonly property bool isCurrent: modelData.key === root.currentKey
-                color: isCurrent ? Qt.rgba(0.13, 0.77, 0.37, 0.1) : Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.055)
-                borderSpec: Border.flat(isCurrent ? Qt.rgba(0.13, 0.77, 0.37, 0.3) : Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.05), 1)
+                readonly property bool isCursor: index === root.cursorIndex
+                readonly property bool isDead: modelData.showDead === true
+                color: isCurrent ? Qt.rgba(0.13, 0.77, 0.37, 0.1)
+                     : (isCursor ? Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.12)
+                                 : Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.055))
+                borderSpec: Border.flat(isCurrent ? Qt.rgba(0.13, 0.77, 0.37, 0.3)
+                                      : (isCursor ? Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.35)
+                                                  : Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.05)), 1)
                 radius: Style.cornerRadius
                 padding: Style.space(7)
+                opacity: isDead ? 0.45 : 1
                 implicitHeight: rowBody.implicitHeight + contentTopInset + contentBottomInset
+
+                // Keeps the keyboard cursor on screen without the panel having
+                // to know how tall a row is — each row knows its own y.
+                onIsCursorChanged: if (isCursor) targetList.revealRow(y, height)
 
                 MouseArea {
                   anchors.fill: parent
                   cursorShape: Qt.PointingHandCursor
+                  acceptedButtons: Qt.LeftButton | Qt.RightButton
                   enabled: root._pendingKey === "" && !selectProc.running
-                  onClicked: root.connectTo(modelData)
+                  onClicked: function(mouse) {
+                    if (mouse.button === Qt.RightButton) {
+                      if (!rowSurface.modelData.isAuto) root.testNode(rowSurface.modelData.key)
+                    } else {
+                      root.connectTo(rowSurface.modelData)
+                    }
+                  }
 
                   RowLayout {
                     id: rowBody
@@ -507,28 +957,42 @@ Panel {
                     spacing: Style.space(6)
 
                     Text {
-                      text: isCurrent ? "●" : modelData.glyph
-                      color: isCurrent ? "#22c55e" : root.dim
+                      text: rowSurface.isCurrent ? "●" : rowSurface.modelData.glyph
+                      color: rowSurface.isCurrent ? root.okColor : root.dim
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.body
                       Layout.alignment: Qt.AlignVCenter
                     }
 
                     Text {
-                      text: modelData.label
+                      text: rowSurface.modelData.label
                       color: root.fg
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.body
-                      font.bold: isCurrent
+                      font.bold: rowSurface.isCurrent
                       elide: Text.ElideRight
                       Layout.fillWidth: true
                       Layout.alignment: Qt.AlignVCenter
                     }
 
                     Text {
-                      visible: modelData.detail !== ""
-                      text: modelData.detail
+                      visible: rowSurface.modelData.detail !== ""
+                      text: rowSurface.modelData.detail
                       color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      Layout.alignment: Qt.AlignVCenter
+                    }
+
+                    // mihomo has already probed most of these; v1.0.0 fetched
+                    // the numbers along with everything else and dropped them
+                    // on the floor.
+                    Text {
+                      visible: rowSurface.modelData.delay > 0 || rowSurface.isDead
+                      text: rowSurface.isDead ? "dead" : Shared.formatDelay(rowSurface.modelData.delay)
+                      color: rowSurface.isDead ? root.badColor
+                           : (rowSurface.modelData.delay < 150 ? root.okColor
+                           : (rowSurface.modelData.delay < 400 ? root.warnColor : root.badColor))
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.caption
                       Layout.alignment: Qt.AlignVCenter
@@ -543,11 +1007,12 @@ Panel {
         // ── Footer ──
         Text {
           Layout.fillWidth: true
-          text: "click switches node · / searches · r refreshes · esc closes"
+          text: "click switches · right-click tests one · j/k move · t tests all · s sorts · b bypasses · / searches"
           color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.3)
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
           horizontalAlignment: Text.AlignHCenter
+          wrapMode: Text.Wrap
         }
       }
     }

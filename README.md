@@ -1,9 +1,11 @@
 # Omarchy Clash Verge
 
 Clash Verge status and node switching in the Omarchy bar. Shows the outbound
-node your traffic is currently going through, lets you switch nodes or
-bypass the proxy entirely, and exposes the rule/global mode toggle — all
-talking directly to Clash Verge's own local API, no extra setup.
+node your traffic is currently going through, its latency, live up/down
+throughput and your subscription quota; lets you switch nodes, drive any
+proxy group in the config or bypass the proxy entirely; and exposes the
+rule/global and TUN toggles — all talking directly to Clash Verge's own
+local API, no extra setup.
 
 ![preview](preview.png)
 
@@ -20,19 +22,68 @@ enough model that it didn't make sense as a fifth backend bolted onto that
 project's `VpnController` — see `model/Clash.js`'s header comment for the
 longer version.
 
+## What is new in 1.1.0
+
+- Per-node latency in the target list, taken from the probe history mihomo
+  already keeps — no extra requests, no extra probing cost.
+- A **Test all** button that probes every node in the group with one
+  request, plus right-click on any row to test just that node.
+- A group picker covering every group in your config instead of just the
+  one named in settings.
+- Correct handling of URLTest and Fallback groups: clicking a node sets a
+  fixed pin (which is how mihomo means it to work), and an **Automatic**
+  row at the top of the list unpins it again.
+- A TUN toggle alongside global mode.
+- Live up/down throughput with session totals and the open connection
+  count.
+- A subscription quota bar showing usage, expiry and a provider update
+  button.
+- An optional bar label showing the node name or live throughput,
+  colour-coded by state.
+- Keyboard navigation: `j`/`k` move, `Enter` activates, plus `t` (test
+  all), `s` (cycle sort) and `b` (bypass).
+- IPC verbs for Hyprland binds — see [Scripting](#scripting).
+- Settings for the unix socket path, a TCP external-controller URL and the
+  API secret, so a mihomo core running on its own works too.
+- Real error messages derived from curl exit codes, instead of reporting
+  every failure as "Clash Verge isn't running".
+
 ## How it talks to Clash Verge
 
 Clash Verge exposes a REST API over a local unix socket
-(`/tmp/verge/verge-mihomo.sock`) — no TCP port, no secret to configure. This
-widget:
+(`/tmp/verge/verge-mihomo.sock`) — no TCP port and no secret for the default
+setup. A core reached over TCP instead works too, via the external-controller
+URL and secret settings below. This widget:
 
-- `GET /configs` — reads `mode` (`rule` / `global` / `direct`)
-- `GET /proxies/<selector group>` — reads the active node and the list of
-  choices in your main selector group
-- `GET /proxies` — reads every proxy's type, to label group members
-  ("Hysteria2", "auto-select group", …) in the target list
-- `PUT /proxies/<selector group>` — switches the active node
-- `PATCH /configs` — flips `mode` (bypass / restore / global toggle)
+- `GET /configs` — reads `mode` (`rule` / `global` / `direct`) and whether
+  TUN is on
+- `GET /proxies/<group>` — reads the active node, choices, type and fixed
+  pin of the group being driven
+- `GET /proxies/GLOBAL` — fallback when the configured group name isn't in
+  the config
+- `GET /proxies` — full proxy dump; member types label the target list,
+  and the delay-probe history each entry carries is where per-node latency
+  comes from
+- `GET /connections` — session totals, throughput counters and the open
+  connection count
+- `GET /providers/proxies` — subscription quota and expiry; fetched on
+  demand and throttled, because it is by far the largest document
+- `GET /group/<group>/delay` — probes every node in the group with one
+  request (the Test all button)
+- `GET /proxies/<node>/delay` — probes a single node (right-click on a row)
+- `PUT /proxies/<group>` — switches the active node, or pins one in an
+  auto-selecting group
+- `DELETE /proxies/<group>` — clears that pin, handing the choice back to
+  the group
+- `PATCH /configs` — flips `mode` (bypass / restore / global) or TUN
+- `PUT /providers/proxies/<name>` — re-fetches a subscription
+
+Polling is tiered so the closed bar stays cheap: a closed panel fetches
+about 3.5 KB per poll (`/configs` plus the active group, plus
+`/connections` only when the bar shows speed), while an open one also pulls
+the full proxy dump at most every 9 seconds — the rest of its polls are
+light ones every 2 seconds, keeping throughput live without re-fetching a
+74 KB list that barely changes.
 
 ## Requirements
 
@@ -61,13 +112,60 @@ ever talked to Clash Verge's API, never to its config files.
 
 | Setting | Default | Description |
 |---|---|---|
-| Refresh interval | 15s | How often the widget re-polls Clash Verge |
-| Selector group name | `主代理` | The proxy group in your config that picks the outbound node. Falls back to `GLOBAL` automatically if this name isn't found — most default Clash Verge profiles use `GLOBAL` directly, so set this to `GLOBAL` (or clear it) if your config doesn't have a custom main selector. |
+| Refresh interval (seconds) | `15` | How often the closed widget re-polls (5–600). While the panel is open it refreshes every 2 seconds so throughput reads live. |
+| Default group | `主代理` | The proxy group the widget steers when it opens. Every other group in your config is one pick away in the panel's group dropdown, so this is only the starting point. Falls back to `GLOBAL` if this name isn't in your config. |
+| Bar label | `Icon` | Icon shows the shield alone. Node adds the active outbound node's name. Speed shows live up/down throughput, which also makes the widget poll `/connections` while closed. |
+| Node order | `Config` | How the node list is sorted when the panel opens: Config keeps your config's order, Latency puts fastest first, Name sorts alphabetically. Press `s` in the panel to cycle it without changing this. |
+| API socket path | *(empty)* | Leave empty for Clash Verge's default, `/tmp/verge/verge-mihomo.sock`. Only set this if you moved it. |
+| External controller URL | *(empty)* | Leave empty to use the unix socket. Set to something like `http://127.0.0.1:9097` to talk to a mihomo core over TCP instead — useful when running the core directly rather than through Clash Verge. |
+| API secret | *(empty)* | Only needed when the external controller above has a secret set. Stored in plain text in `shell.json`, like every other shell setting — leave empty when using the unix socket, which needs no secret. |
+
+## Scripting
+
+Everything the panel can do is also an IPC verb, run as
+`omarchy-shell jackzasian.clash-verge VERB`:
+
+```bash
+omarchy-shell jackzasian.clash-verge status
+omarchy-shell jackzasian.clash-verge bypass
+omarchy-shell jackzasian.clash-verge select '香港pump1'
+omarchy-shell jackzasian.clash-verge mode rule
+omarchy-shell jackzasian.clash-verge tun true
+omarchy-shell jackzasian.clash-verge group 主代理
+omarchy-shell jackzasian.clash-verge test
+```
+
+The full verb set:
+
+| Verb | Effect |
+|---|---|
+| `open`, `show` | Open the panel |
+| `close`, `hide` | Close the panel |
+| `toggle` | Open the panel if closed, close it if open |
+| `status` | Print the one-line summary shown in the hero |
+| `refreshNow` | Force an immediate poll |
+| `bypass` | Switch to `direct` — traffic stops being proxied |
+| `restore` | Back to `rule` mode |
+| `toggleProxy` | Flip between bypassed and restored |
+| `mode <rule\|global\|direct>` | Set the mode explicitly |
+| `tun <true\|false>` | Turn the TUN device on or off |
+| `select <node>` | Switch to (or, in an auto group, pin) a node |
+| `auto` | Unpin the active auto group, letting it choose again |
+| `group <name>` | Point the widget at another proxy group |
+| `test` | Latency-test every node in the active group |
+
+Which makes Hyprland binds like these possible:
+
+```ini
+bind = $mainMod SHIFT, V, exec, omarchy-shell jackzasian.clash-verge toggleProxy
+bind = $mainMod SHIFT, C, exec, omarchy-shell jackzasian.clash-verge toggle
+bind = $mainMod SHIFT, B, exec, omarchy-shell jackzasian.clash-verge auto
+```
 
 ## Tests
 
 The parsing and row-building logic lives in `model/Clash.js`, tested without
-a QML engine:
+a QML engine — 103 tests as of 1.1.0:
 
 ```bash
 node tests/run.js
@@ -81,6 +179,12 @@ cd .. && qmllint -I /usr/share/omarchy/shell omarchy-clash-verge/Panel.qml
 pointed at as an implicit import, which makes `Panel.qml`, a `Panel` deriving
 from `qs.Ui`'s own `Panel`, resolve to itself. Not a defect in the file being
 checked — same note as jkoestinger/omarchy-vpn's own `ARCHITECTURE.md`.)
+
+One more `qmllint` caveat on current Qt: it cannot parse Quickshell's typed
+IPC function signatures such as `function open(): void`, reporting each as a
+syntax error. Omarchy's own `Ui/Panel.qml` fails identically, so there is
+nothing to fix in this file — lint a copy with the return-type annotations
+stripped if you want a clean pass.
 
 ## License
 
