@@ -1,11 +1,10 @@
-# Omarchy Clash Verge
+# Omarchy Clash Verge Plus
 
-Clash Verge status and node switching in the Omarchy bar. Shows the outbound
-node your traffic is currently going through, its latency, live up/down
-throughput and your subscription quota; lets you switch nodes, drive any
-proxy group in the config or bypass the proxy entirely; and exposes the
-rule/global and TUN toggles — all talking directly to Clash Verge's own
-local API, no extra setup.
+An Omarchy bar plugin for Clash Verge and standalone Mihomo cores. In addition
+to node switching, latency and traffic, this fork manages multiple providers,
+refreshes HTTP subscriptions automatically, predicts quota exhaustion from
+local usage history, and repairs stale proxy connections after the default
+network changes.
 
 ![preview](preview.png)
 
@@ -22,7 +21,26 @@ enough model that it didn't make sense as a fifth backend bolted onto that
 project's `VpnController` — see `model/Clash.js`'s header comment for the
 longer version.
 
-## What is new in 1.1.0
+## What this fork adds in 1.2.0
+
+- Lists every managed HTTP and File provider, including quota-free fallback
+  providers, with per-provider and **Refresh all** actions.
+- Allows a comma-separated provider list to select and order the subscriptions
+  shown by the panel.
+- Automatically refreshes all managed HTTP subscriptions on a configurable
+  interval; the manual action bypasses the old two-minute display throttle.
+- Stores quota-only snapshots under
+  `~/.local/state/omarchy/clash-verge-plus/quota-history.json`. URLs, node
+  credentials and subscription contents are never written there.
+- Estimates time to exhaustion from the current monotonic quota cycle. It
+  waits for at least two samples spanning 30 minutes, ignores samples before
+  a quota reset, and shows confidence based on the observation span.
+- Optionally watches the default route. After a network change it closes stale
+  Mihomo connections, immediately health-checks each managed provider, and
+  refreshes the panel.
+- Adds `refreshSubscriptions` and `recoverNetwork` IPC actions for scripting.
+
+## Features inherited from 1.1.0
 
 - Per-node latency in the target list, taken from the probe history mihomo
   already keeps — no extra requests, no extra probing cost.
@@ -77,6 +95,10 @@ URL and secret settings below. This widget:
   the group
 - `PATCH /configs` — flips `mode` (bypass / restore / global) or TUN
 - `PUT /providers/proxies/<name>` — re-fetches a subscription
+- `GET /providers/proxies/<name>/healthcheck` — immediately re-tests provider
+  nodes after a network change
+- `DELETE /connections` — drops connections tied to the previous uplink so
+  clients reconnect through the new one
 
 Polling is tiered so the closed bar stays cheap: a closed panel fetches
 about 3.5 KB per poll (`/configs` plus the active group, plus
@@ -89,18 +111,21 @@ light ones every 2 seconds, keeping throughput live without re-fetching a
 
 - Omarchy Quattro with shell plugin support
 - [Clash Verge](https://github.com/clash-verge-rev/clash-verge-rev) running,
-  with its socket at the default path
+  with its socket at the default path, or a standalone Mihomo controller URL
 
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/jackzasian/omarchy-clash-verge.git --enable
+git clone --branch feat/subscription-intelligence \
+  https://github.com/hulingjun/omarchy-clash-verge.git \
+  ~/.config/omarchy/plugins/hulingjun.clash-verge-plus
+omarchy plugin enable hulingjun.clash-verge-plus right
 ```
 
 ## Remove
 
 ```bash
-omarchy plugin remove jackzasian.clash-verge
+omarchy plugin remove hulingjun.clash-verge-plus
 ```
 
 Removal only deletes the plugin's own directory under
@@ -113,6 +138,12 @@ ever talked to Clash Verge's API, never to its config files.
 | Setting | Default | Description |
 |---|---|---|
 | Refresh interval (seconds) | `15` | How often the closed widget re-polls (5–600). While the panel is open it refreshes every 2 seconds so throughput reads live. |
+| Managed subscriptions | *(empty)* | Comma-separated provider names to show and manage, in display order. Empty manages every HTTP/File provider. |
+| Automatic subscription refresh | `On` | Periodically update managed HTTP providers. |
+| Subscription refresh interval | `60` | Automatic refresh period in minutes. |
+| Quota exhaustion forecast | `On` | Persist quota-only history and estimate exhaustion. |
+| Quota history retention | `30` | History retention in days. Resets start a new prediction cycle. |
+| Recover after network changes | `On` | Close stale connections and health-check providers when the default route changes. |
 | Default group | `主代理` | The proxy group the widget steers when it opens. Every other group in your config is one pick away in the panel's group dropdown, so this is only the starting point. Falls back to `GLOBAL` if this name isn't in your config. |
 | Bar label | `Icon` | Icon shows the shield alone. Node adds the active outbound node's name. Speed shows live up/down throughput, which also makes the widget poll `/connections` while closed. |
 | Node order | `Config` | How the node list is sorted when the panel opens: Config keeps your config's order, Latency puts fastest first, Name sorts alphabetically. Press `s` in the panel to cycle it without changing this. |
@@ -123,16 +154,18 @@ ever talked to Clash Verge's API, never to its config files.
 ## Scripting
 
 Everything the panel can do is also an IPC verb, run as
-`omarchy-shell jackzasian.clash-verge VERB`:
+`omarchy-shell hulingjun.clash-verge-plus VERB`:
 
 ```bash
-omarchy-shell jackzasian.clash-verge status
-omarchy-shell jackzasian.clash-verge bypass
-omarchy-shell jackzasian.clash-verge select '香港pump1'
-omarchy-shell jackzasian.clash-verge mode rule
-omarchy-shell jackzasian.clash-verge tun true
-omarchy-shell jackzasian.clash-verge group 主代理
-omarchy-shell jackzasian.clash-verge test
+omarchy-shell hulingjun.clash-verge-plus status
+omarchy-shell hulingjun.clash-verge-plus refreshSubscriptions
+omarchy-shell hulingjun.clash-verge-plus recoverNetwork
+omarchy-shell hulingjun.clash-verge-plus bypass
+omarchy-shell hulingjun.clash-verge-plus select '香港pump1'
+omarchy-shell hulingjun.clash-verge-plus mode rule
+omarchy-shell hulingjun.clash-verge-plus tun true
+omarchy-shell hulingjun.clash-verge-plus group 主代理
+omarchy-shell hulingjun.clash-verge-plus test
 ```
 
 The full verb set:
@@ -144,6 +177,8 @@ The full verb set:
 | `toggle` | Open the panel if closed, close it if open |
 | `status` | Print the one-line summary shown in the hero |
 | `refreshNow` | Force an immediate poll |
+| `refreshSubscriptions` | Update every managed HTTP subscription and reload quota data |
+| `recoverNetwork` | Close stale connections and immediately health-check providers |
 | `bypass` | Switch to `direct` — traffic stops being proxied |
 | `restore` | Back to `rule` mode |
 | `toggleProxy` | Flip between bypassed and restored |
@@ -157,15 +192,15 @@ The full verb set:
 Which makes Hyprland binds like these possible:
 
 ```ini
-bind = $mainMod SHIFT, V, exec, omarchy-shell jackzasian.clash-verge toggleProxy
-bind = $mainMod SHIFT, C, exec, omarchy-shell jackzasian.clash-verge toggle
-bind = $mainMod SHIFT, B, exec, omarchy-shell jackzasian.clash-verge auto
+bind = $mainMod SHIFT, V, exec, omarchy-shell hulingjun.clash-verge-plus toggleProxy
+bind = $mainMod SHIFT, C, exec, omarchy-shell hulingjun.clash-verge-plus toggle
+bind = $mainMod SHIFT, B, exec, omarchy-shell hulingjun.clash-verge-plus auto
 ```
 
 ## Tests
 
 The parsing and row-building logic lives in `model/Clash.js`, tested without
-a QML engine — 103 tests as of 1.1.0:
+a QML engine — 109 tests as of 1.2.0:
 
 ```bash
 node tests/run.js

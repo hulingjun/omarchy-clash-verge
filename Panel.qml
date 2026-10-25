@@ -16,8 +16,8 @@ import "model/Clash.js" as Clash
 // would be the wrong model even if it were wired in as a backend there.
 Panel {
   id: root
-  moduleName: "jackzasian.clash-verge"
-  ipcTarget: "jackzasian.clash-verge"
+  moduleName: "hulingjun.clash-verge-plus"
+  ipcTarget: "hulingjun.clash-verge-plus"
   // The base Panel's own IpcHandler only knows open/close/toggle. This widget
   // registers those plus the node/mode/group verbs below on the same target,
   // so a Hyprland bind can flip the proxy without opening anything.
@@ -36,6 +36,21 @@ Panel {
     var n = typeof v === "number" ? v : parseInt(String(v), 10)
     return (isFinite(n) && n >= 5) ? n : 15
   }
+  readonly property var managedProviderNames: Clash.parseManagedProviders(root.setting("managedProviders", ""))
+  readonly property bool autoRefreshSubscriptions: String(root.setting("autoRefreshSubscriptions", "On")).toLowerCase() !== "off"
+  readonly property int subscriptionRefreshMinutes: {
+    var n = Number(root.setting("subscriptionRefreshMinutes", 60))
+    return isFinite(n) && n >= 5 ? n : 60
+  }
+  readonly property bool quotaForecastEnabled: String(root.setting("quotaForecast", "On")).toLowerCase() !== "off"
+  readonly property int quotaHistoryDays: {
+    var n = Number(root.setting("quotaHistoryDays", 30))
+    return isFinite(n) && n >= 7 ? n : 30
+  }
+  readonly property bool recoverOnNetworkChange: String(root.setting("recoverOnNetworkChange", "On")).toLowerCase() !== "off"
+  readonly property string stateDir: (Quickshell.env("XDG_STATE_HOME") || Quickshell.env("HOME") + "/.local/state")
+    + "/omarchy/clash-verge-plus"
+  readonly property string historyPath: root.stateDir + "/quota-history.json"
   readonly property string selectorGroupName: {
     var v = settings ? settings.selectorGroup : undefined
     var s = String(v === undefined || v === null ? "" : v).trim()
@@ -63,6 +78,13 @@ Panel {
   property var netSample: ({ loaded: false })
   property var rates: ({ known: false })
   property var providers: []
+  property var usageHistory: ({ version: 1, providers: ({}) })
+  property bool historyLoaded: false
+  property bool stateReady: false
+  property var providerUpdateQueue: []
+  property var networkHealthQueue: []
+  property string routeSignature: ""
+  property bool routeInitialized: false
   property string filter: ""
   property string sortMode: root.defaultSortMode
   property string groupOverride: ""      // set by the picker, beats the setting
@@ -104,7 +126,8 @@ Panel {
   readonly property var toggles: applyPendingToggles(Clash.clashToggles(root.state), root._pendingToggles)
   readonly property string currentKey: Clash.clashCurrentKey(root.state)
   readonly property var targets: Clash.clashTargets(root.state, root.filter, root.sortMode)
-  readonly property var subscriptions: Clash.subscriptionRows(root.providers, root.nowMillis)
+  readonly property var subscriptions: Clash.subscriptionRows(root.providers, root.nowMillis,
+                                                                 root.usageHistory, root.quotaForecastEnabled)
   readonly property string visibleError: root.lastError !== "" ? root.lastError : root.statusError
   readonly property string emptyText: !root.loaded
     ? "Checking…"
@@ -232,8 +255,9 @@ Panel {
   }
 
   // ── Actions ───────────────────────────────────────────────────────────────
-  function httpCommand(method, path, body) {
-    var args = ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "8"]
+  function httpCommand(method, path, body, timeoutSeconds) {
+    var timeout = Number(timeoutSeconds || 8)
+    var args = ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", String(timeout)]
       .concat(Clash.curlArgs(root.api))
       .concat(["-X", method, Clash.apiUrl(root.api, path)])
     if (body !== undefined && body !== null) {
@@ -352,11 +376,66 @@ Panel {
   }
 
   function updateProvider(name) {
-    if (providerUpdateProc.running) return
+    if (providerUpdateProc.running || String(name || "") === "") return
     clearError()
+    root.providerUpdateQueue = [String(name)]
+    updateNextProvider()
+  }
+
+  function updateAllProviders() {
+    if (providerUpdateProc.running) return
+    var names = []
+    for (var i = 0; i < root.providers.length; i++) {
+      if (root.providers[i].vehicleType === "HTTP") names.push(root.providers[i].name)
+    }
+    if (names.length === 0) { root.loadProviders(true); return }
+    clearError()
+    root.providerUpdateQueue = names
+    updateNextProvider()
+  }
+
+  function updateNextProvider() {
+    if (providerUpdateProc.running) return
+    if (root.providerUpdateQueue.length === 0) {
+      root.actionStatus = ""
+      root.loadProviders(true)
+      root.refresh()
+      return
+    }
+    var queue = root.providerUpdateQueue.slice()
+    var name = queue.shift()
+    root.providerUpdateQueue = queue
+    providerUpdateProc.providerName = name
     root.actionStatus = "Updating " + name + "…"
-    providerUpdateProc.command = httpCommand("PUT", "/providers/proxies/" + encodeURIComponent(name), null)
+    providerUpdateProc.command = httpCommand("PUT", "/providers/proxies/" + encodeURIComponent(name), null, 45)
     providerUpdateProc.running = true
+  }
+
+  function recoverAfterNetworkChange() {
+    if (!root.recoverOnNetworkChange || networkRecoverProc.running) return
+    root.actionStatus = "Recovering proxy after network change…"
+    networkRecoverProc.command = httpCommand("DELETE", "/connections", null)
+    networkRecoverProc.running = true
+  }
+
+  function healthCheckNextProvider() {
+    if (networkHealthProc.running) return
+    if (root.networkHealthQueue.length === 0) {
+      root.actionStatus = ""
+      root.loadProviders(true)
+      root.refresh()
+      return
+    }
+    var queue = root.networkHealthQueue.slice()
+    var name = queue.shift()
+    root.networkHealthQueue = queue
+    networkHealthProc.command = getCommand("/providers/proxies/" + encodeURIComponent(name) + "/healthcheck", 10)
+    networkHealthProc.running = true
+  }
+
+  function checkDefaultRoute() {
+    if (routeProc.running) return
+    routeProc.running = true
   }
 
   // ── Keyboard cursor ───────────────────────────────────────────────────────
@@ -393,7 +472,11 @@ Panel {
     }
   }
 
-  Component.onCompleted: refresh()
+  Component.onCompleted: {
+    ensureStateProc.running = true
+    refresh()
+    checkDefaultRoute()
+  }
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
@@ -411,6 +494,8 @@ Panel {
     function toggle(): void { root.toggle() }
     function status(): string { return root.summary }
     function refreshNow(): void { root.refresh() }
+    function refreshSubscriptions(): void { root.updateAllProviders() }
+    function recoverNetwork(): void { root.recoverAfterNetworkChange() }
     function bypass(): void { root.setMode("direct") }
     function restore(): void { root.setMode("rule") }
     function toggleProxy(): void { root.toggleConnection() }
@@ -510,8 +595,15 @@ Panel {
     command: []
     stdout: StdioCollector { id: providerStdout; waitForEnd: true }
     onExited: function(exitCode) {
-      root.providers = Clash.parseProviders(String(providerStdout.text || ""))
-      root.providersFetchedAt = Date.now()
+      var now = Date.now()
+      var parsed = Clash.filterProviders(Clash.parseProviders(String(providerStdout.text || "")),
+                                         root.managedProviderNames)
+      root.providers = parsed
+      root.providersFetchedAt = now
+      if (root.quotaForecastEnabled) {
+        root.usageHistory = Clash.observeUsage(root.usageHistory, parsed, now, root.quotaHistoryDays)
+        historyFile.setText(JSON.stringify(root.usageHistory, null, 2) + "\n")
+      }
     }
   }
 
@@ -519,14 +611,87 @@ Panel {
     id: providerUpdateProc
     running: false
     command: []
+    property string providerName: ""
     stdout: StdioCollector { id: providerUpdateStdout; waitForEnd: true }
     onExited: function(exitCode) {
       var code = String(providerUpdateStdout.text || "").trim()
-      root.actionStatus = ""
-      if (code !== "200" && code !== "204") root.setError("Provider update failed (HTTP " + (code || "?") + ")")
-      root.loadProviders(true)
-      root.refresh()
+      if (code !== "200" && code !== "204") {
+        root.setError(providerUpdateProc.providerName + " update failed (HTTP " + (code || "?") + ")")
+      }
+      root.updateNextProvider()
     }
+  }
+
+  FileView {
+    id: historyFile
+    path: root.historyPath
+    watchChanges: false
+    atomicWrites: true
+    printErrors: false
+    onLoaded: {
+      root.usageHistory = Clash.parseUsageHistory(text())
+      root.historyLoaded = true
+      if (root.stateReady && root.providersFetchedAt === 0) root.loadProviders(true)
+    }
+    onLoadFailed: {
+      root.usageHistory = Clash.parseUsageHistory("")
+      root.historyLoaded = true
+      if (root.stateReady && root.providersFetchedAt === 0) root.loadProviders(true)
+    }
+  }
+
+  Process {
+    id: ensureStateProc
+    running: false
+    command: ["mkdir", "-p", root.stateDir]
+    onExited: {
+      root.stateReady = true
+      if (root.historyLoaded) root.loadProviders(true)
+      else historyFile.reload()
+    }
+  }
+
+  Process {
+    id: routeProc
+    running: false
+    command: ["bash", "-c",
+      "r=$(ip -4 route show default 2>/dev/null | head -n1); "
+      + "d=$(awk '{for(i=1;i<=NF;i++)if($i==\"dev\"){print $(i+1);exit}}' <<<\"$r\"); "
+      + "u=$(nmcli -g GENERAL.CON-UUID device show \"$d\" 2>/dev/null | head -n1); "
+      + "[[ -n $r && -n $u ]] && printf '%s|%s' \"$u\" \"$r\" || true"]
+    stdout: StdioCollector { id: routeStdout; waitForEnd: true }
+    onExited: {
+      var signature = String(routeStdout.text || "").trim()
+      if (signature === "") return
+      if (!root.routeInitialized) {
+        root.routeSignature = signature
+        root.routeInitialized = true
+      } else if (signature !== root.routeSignature) {
+        root.routeSignature = signature
+        root.recoverAfterNetworkChange()
+      }
+    }
+  }
+
+  Process {
+    id: networkRecoverProc
+    running: false
+    command: []
+    stdout: StdioCollector { waitForEnd: true }
+    onExited: {
+      var names = []
+      for (var i = 0; i < root.providers.length; i++) names.push(root.providers[i].name)
+      root.networkHealthQueue = names
+      root.healthCheckNextProvider()
+    }
+  }
+
+  Process {
+    id: networkHealthProc
+    running: false
+    command: []
+    stdout: StdioCollector { waitForEnd: true }
+    onExited: root.healthCheckNextProvider()
   }
 
   Timer {
@@ -541,6 +706,20 @@ Panel {
     running: true
     repeat: true
     onTriggered: root.refresh()
+  }
+
+  Timer {
+    interval: root.subscriptionRefreshMinutes * 60 * 1000
+    running: root.autoRefreshSubscriptions
+    repeat: true
+    onTriggered: root.updateAllProviders()
+  }
+
+  Timer {
+    interval: 5000
+    running: root.recoverOnNetworkChange
+    repeat: true
+    onTriggered: root.checkDefaultRoute()
   }
 
   // A shorter beat while the panel is open, so throughput reads as a live
@@ -790,10 +969,32 @@ Panel {
           }
         }
 
-        // ── Subscription ──
-        // Nothing else in the API reports how much of a paid plan is left, and
-        // it is exactly the thing you want to know before switching to the
-        // node that streams 4K.
+        // ── Subscriptions ──
+        RowLayout {
+          visible: root.subscriptions.length > 0
+          Layout.fillWidth: true
+          spacing: Style.space(6)
+          Text {
+            text: "Subscriptions (" + root.subscriptions.length + ")"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            Layout.fillWidth: true
+          }
+          Button {
+            text: "Refresh all"
+            foreground: root.dim
+            tooltipText: root.autoRefreshSubscriptions
+              ? "Update all HTTP subscriptions now · automatic every " + root.subscriptionRefreshMinutes + "m"
+              : "Update all HTTP subscriptions now"
+            fontFamily: root.fontFamily
+            fontSize: Style.font.caption
+            horizontalPadding: Style.space(6)
+            verticalPadding: Style.space(1)
+            onClicked: root.updateAllProviders()
+          }
+        }
+
         Repeater {
           model: root.subscriptions
           delegate: ColumnLayout {
@@ -813,9 +1014,9 @@ Panel {
                 Layout.fillWidth: true
               }
               Text {
-                text: modelData.used + " / " + modelData.total
+                text: modelData.quotaText
                   + (modelData.expiry !== "" ? " · " + modelData.expiry : "")
-                color: modelData.ratio > 0.9 ? root.warnColor : root.dim
+                color: modelData.forecastRisk || modelData.ratio > 0.9 ? root.warnColor : root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
               }
@@ -832,7 +1033,20 @@ Panel {
               }
             }
 
+            Text {
+              visible: modelData.updated !== "" || modelData.forecast !== ""
+              text: (modelData.forecast !== "" ? modelData.forecast : "")
+                + (modelData.forecastConfidence !== "" ? " · " + modelData.forecastConfidence + " confidence" : "")
+                + (modelData.updated !== "" ? " · updated " + modelData.updated : "")
+              color: modelData.forecastRisk ? root.warnColor : root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideRight
+              Layout.fillWidth: true
+            }
+
             Rectangle {
+              visible: modelData.hasQuota
               Layout.fillWidth: true
               implicitHeight: Style.space(3)
               radius: height / 2

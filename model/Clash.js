@@ -317,10 +317,9 @@ function computeRates(previous, current) {
   }
 }
 
-// /providers/proxies is ~295 KB on this config because it inlines every proxy
-// of every provider, so it is fetched on demand and throttled rather than
-// polled. What is worth having out of it is the subscription counter most
-// paid configs carry and nothing else in the API exposes.
+// /providers/proxies includes every configured provider. HTTP providers can
+// be refreshed; file providers are still useful as visible fallbacks even
+// when they do not expose subscription quota headers.
 function parseProviders(raw) {
   var payload = tryParseJson(raw)
   var out = []
@@ -328,41 +327,146 @@ function parseProviders(raw) {
   for (var name in payload.providers) {
     var entry = payload.providers[name]
     if (!entry || typeof entry !== "object") continue
+    var vehicleType = String(entry.vehicleType || "")
+    if (vehicleType !== "HTTP" && vehicleType !== "File") continue
     var info = entry.subscriptionInfo
-    if (!info || typeof info !== "object") continue
-    var total = Number(info.Total || 0)
-    if (!isFinite(total) || total <= 0) continue
-    var upload = Number(info.Upload || 0)
-    var download = Number(info.Download || 0)
+    var hasQuota = !!info && typeof info === "object" && Number(info.Total || 0) > 0
+    var total = hasQuota ? Number(info.Total || 0) : 0
+    var upload = hasQuota ? Number(info.Upload || 0) : 0
+    var download = hasQuota ? Number(info.Download || 0) : 0
     out.push({
       name: String(name),
-      vehicleType: String(entry.vehicleType || ""),
+      vehicleType: vehicleType,
       updatedAt: Shared.parseTime(entry.updatedAt),
       upload: upload,
       download: download,
       used: upload + download,
       total: total,
-      expire: Shared.parseTime(Number(info.Expire || 0)),
-      ratio: Math.max(0, Math.min(1, (upload + download) / total))
+      expire: hasQuota ? Shared.parseTime(Number(info.Expire || 0)) : 0,
+      ratio: hasQuota ? Math.max(0, Math.min(1, (upload + download) / total)) : 0,
+      hasQuota: hasQuota
     })
   }
   out.sort(function(a, b) { return a.name < b.name ? -1 : (a.name > b.name ? 1 : 0) })
   return out
 }
 
-function subscriptionRows(providers, nowMillis) {
+function parseManagedProviders(raw) {
+  var values = String(raw || "").split(/[\n,]/)
+  var out = []
+  var seen = {}
+  for (var i = 0; i < values.length; i++) {
+    var name = values[i].trim()
+    if (name === "" || seen[name]) continue
+    seen[name] = true
+    out.push(name)
+  }
+  return out
+}
+
+function filterProviders(providers, managed) {
+  var list = Array.isArray(providers) ? providers.slice() : []
+  var names = Array.isArray(managed) ? managed : parseManagedProviders(managed)
+  if (names.length === 0) return list
+  var byName = {}
+  for (var i = 0; i < list.length; i++) byName[list[i].name] = list[i]
+  var out = []
+  for (var j = 0; j < names.length; j++) if (byName[names[j]]) out.push(byName[names[j]])
+  return out
+}
+
+function parseUsageHistory(raw) {
+  var parsed = typeof raw === "string" ? tryParseJson(raw) : raw
+  if (!parsed || typeof parsed !== "object" || parsed.version !== 1
+      || !parsed.providers || typeof parsed.providers !== "object") {
+    return { version: 1, providers: {} }
+  }
+  return parsed
+}
+
+function observeUsage(history, providers, nowMillis, retentionDays) {
+  var source = parseUsageHistory(history)
+  var out = { version: 1, providers: {} }
+  var cutoff = Number(nowMillis) - Math.max(1, Number(retentionDays || 30)) * 86400000
+  for (var oldName in source.providers) {
+    var oldRows = Array.isArray(source.providers[oldName]) ? source.providers[oldName] : []
+    out.providers[oldName] = oldRows.filter(function(row) {
+      return row && Number(row.at) >= cutoff && Number(row.used) >= 0 && Number(row.total) > 0
+    }).slice(-720)
+  }
+  for (var i = 0; i < (providers || []).length; i++) {
+    var provider = providers[i]
+    if (!provider.hasQuota || provider.total <= 0) continue
+    var rows = out.providers[provider.name] || []
+    var last = rows.length ? rows[rows.length - 1] : null
+    // Keep a sample when usage changes, and at least every six hours so a
+    // quiet subscription still has a recent anchor after shell restarts.
+    if (!last || last.used !== provider.used || last.total !== provider.total
+        || Number(nowMillis) - last.at >= 21600000) {
+      rows.push({ at: Number(nowMillis), used: provider.used, total: provider.total,
+                  expire: provider.expire || 0 })
+    }
+    out.providers[provider.name] = rows.slice(-720)
+  }
+  return out
+}
+
+function quotaForecast(provider, history, nowMillis) {
+  var none = { known: false, rate: 0, exhaustAt: 0, risk: false, confidence: "", text: "Learning usage" }
+  if (!provider || !provider.hasQuota || provider.total <= provider.used) {
+    if (provider && provider.hasQuota && provider.total <= provider.used) {
+      return { known: true, rate: 0, exhaustAt: Number(nowMillis), risk: true,
+               confidence: "high", text: "Quota exhausted" }
+    }
+    return none
+  }
+  var parsed = parseUsageHistory(history)
+  var rows = Array.isArray(parsed.providers[provider.name]) ? parsed.providers[provider.name] : []
+  var segment = []
+  for (var i = rows.length - 1; i >= 0; i--) {
+    var row = rows[i]
+    if (!row || row.total !== provider.total || row.used > provider.used) break
+    if (segment.length && row.used > segment[segment.length - 1].used) break
+    segment.unshift(row)
+  }
+  if (segment.length < 2) return none
+  var first = segment[0]
+  var last = segment[segment.length - 1]
+  var span = last.at - first.at
+  var consumed = last.used - first.used
+  if (span < 1800000 || consumed <= 0) return none
+  var rate = consumed / span
+  var remaining = Math.max(0, provider.total - provider.used)
+  var exhaustAt = Number(nowMillis) + remaining / rate
+  var risk = provider.expire > 0 && exhaustAt < provider.expire
+  var confidence = span >= 3 * 86400000 ? "high" : (span >= 86400000 ? "medium" : "low")
+  var text = "At current rate: " + Shared.formatDuration(exhaustAt - Number(nowMillis)) + " left"
+  if (provider.expire > 0 && !risk) text = "Enough until renewal"
+  return { known: true, rate: rate, exhaustAt: exhaustAt, risk: risk,
+           confidence: confidence, text: text }
+}
+
+function subscriptionRows(providers, nowMillis, history, forecastEnabled) {
   var out = []
   for (var i = 0; i < (providers || []).length; i++) {
     var p = providers[i]
+    var forecast = forecastEnabled === false ? { known: false, risk: false, text: "" }
+      : quotaForecast(p, history, nowMillis)
     out.push({
       key: p.name,
       label: p.name,
       used: Shared.formatBytes(p.used),
       total: Shared.formatBytes(p.total),
+      quotaText: p.hasQuota ? Shared.formatBytes(p.used) + " / " + Shared.formatBytes(p.total) : "Quota unavailable",
       ratio: p.ratio,
       expiry: Shared.formatUntil(p.expire, nowMillis),
       updated: Shared.formatSince(p.updatedAt, nowMillis),
-      updatable: p.vehicleType === "HTTP"
+      updatable: p.vehicleType === "HTTP",
+      hasQuota: p.hasQuota,
+      forecast: forecast.text,
+      forecastKnown: forecast.known,
+      forecastRisk: forecast.risk,
+      forecastConfidence: forecast.confidence
     })
   }
   return out
@@ -665,6 +769,11 @@ if (typeof module !== "undefined") {
     parseConnections: parseConnections,
     computeRates: computeRates,
     parseProviders: parseProviders,
+    parseManagedProviders: parseManagedProviders,
+    filterProviders: filterProviders,
+    parseUsageHistory: parseUsageHistory,
+    observeUsage: observeUsage,
+    quotaForecast: quotaForecast,
     subscriptionRows: subscriptionRows,
     parseDelayMap: parseDelayMap,
     parseSingleDelay: parseSingleDelay,

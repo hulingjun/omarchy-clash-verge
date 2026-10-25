@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
-  "id": "jackzasian.clash-verge",
-  "name": "Clash Verge",
-  "version": "1.1.0",
-  "author": "jackzasian",
+  "id": "hulingjun.clash-verge-plus",
+  "name": "Clash Verge Plus",
+  "version": "1.2.0",
+  "author": "hulingjun, based on jackzasian/omarchy-clash-verge",
   "license": "MIT",
-  "description": "Clash Verge proxy status, node switching, latency testing and traffic in the Omarchy bar.",
+  "description": "Clash Verge control, multi-subscription automation, quota forecasting and network-change recovery in the Omarchy bar.",
   "kinds": [
     "bar-widget"
   ],
@@ -20,6 +20,12 @@
     "defaultSection": "right",
     "defaults": {
       "refreshIntervalSec": 15,
+      "managedProviders": "",
+      "autoRefreshSubscriptions": "On",
+      "subscriptionRefreshMinutes": 60,
+      "quotaForecast": "On",
+      "quotaHistoryDays": 30,
+      "recoverOnNetworkChange": "On",
       "selectorGroup": "主代理",
       "barLabel": "Icon",
       "sortMode": "Config",
@@ -37,6 +43,57 @@
         "step": 5,
         "defaultValue": 15,
         "description": "How often the closed widget re-polls. While the panel is open it refreshes every 2 seconds so throughput reads live."
+      },
+      {
+        "key": "managedProviders",
+        "type": "string",
+        "label": "Managed subscriptions",
+        "defaultValue": "",
+        "description": "Comma-separated provider names to show and manage, in display order. Leave empty to manage every HTTP and File provider exposed by Mihomo."
+      },
+      {
+        "key": "autoRefreshSubscriptions",
+        "type": "enum",
+        "label": "Automatic subscription refresh",
+        "options": ["On", "Off"],
+        "defaultValue": "On",
+        "description": "Periodically update every managed HTTP subscription and reload quota counters."
+      },
+      {
+        "key": "subscriptionRefreshMinutes",
+        "type": "integer",
+        "label": "Subscription refresh interval (minutes)",
+        "min": 5,
+        "max": 1440,
+        "step": 5,
+        "defaultValue": 60,
+        "description": "How often automatic subscription refresh runs."
+      },
+      {
+        "key": "quotaForecast",
+        "type": "enum",
+        "label": "Quota exhaustion forecast",
+        "options": ["On", "Off"],
+        "defaultValue": "On",
+        "description": "Store quota-only history locally and estimate when each subscription will run out at its current usage rate. Subscription URLs are never stored."
+      },
+      {
+        "key": "quotaHistoryDays",
+        "type": "integer",
+        "label": "Quota history retention (days)",
+        "min": 7,
+        "max": 180,
+        "step": 1,
+        "defaultValue": 30,
+        "description": "History window used for quota prediction. A quota reset automatically starts a new prediction cycle."
+      },
+      {
+        "key": "recoverOnNetworkChange",
+        "type": "enum",
+        "label": "Recover after network changes",
+        "options": ["On", "Off"],
+        "defaultValue": "On",
+        "description": "When the default route changes, close stale Mihomo connections and immediately health-check managed providers."
       },
       {
         "key": "selectorGroup",

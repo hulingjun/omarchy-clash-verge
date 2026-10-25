@@ -103,6 +103,16 @@ function formatUntil(millis, nowMillis) {
   return Math.floor(days / 30) + "mo left"
 }
 
+function formatDuration(millis) {
+  var seconds = Math.max(0, Number(millis || 0) / 1000)
+  if (!isFinite(seconds)) return ""
+  if (seconds < 3600) return Math.max(1, Math.round(seconds / 60)) + "m"
+  if (seconds < 86400) return Math.max(1, Math.round(seconds / 3600)) + "h"
+  var days = Math.max(1, Math.round(seconds / 86400))
+  if (days < 60) return days + "d"
+  return Math.round(days / 30) + "mo"
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     GLYPH_VPN: GLYPH_VPN,
@@ -121,6 +131,7 @@ if (typeof module !== "undefined") {
     formatDelay: formatDelay,
     parseTime: parseTime,
     formatSince: formatSince,
-    formatUntil: formatUntil
+    formatUntil: formatUntil,
+    formatDuration: formatDuration
   }
 }

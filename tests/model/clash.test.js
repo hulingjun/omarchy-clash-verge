@@ -119,6 +119,12 @@ test("formatUntil counts down and says so when it has run out", () => {
   eq(Shared.formatUntil(now + 200 * 86400 * 1000, now), "6mo left")
 })
 
+test("formatDuration chooses a useful coarse unit", () => {
+  eq(Shared.formatDuration(30 * 60 * 1000), "30m")
+  eq(Shared.formatDuration(5 * 3600 * 1000), "5h")
+  eq(Shared.formatDuration(12 * 86400 * 1000), "12d")
+})
+
 test("elide collapses whitespace and cuts at the limit", () => {
   eq(Shared.elide("  a   b  ", 10), "a b")
   eq(Shared.elide("abcdefghij", 5), "abcd…")
@@ -443,10 +449,11 @@ const PROVIDERS_RAW = JSON.stringify({
   }
 })
 
-test("parseProviders keeps only entries with a real subscription counter", () => {
+test("parseProviders keeps HTTP and File providers, including unmetered fallbacks", () => {
   const providers = Clash.parseProviders(PROVIDERS_RAW)
-  eq(providers.length, 2)
-  eq(providers.map(p => p.name), ["aaa-local", "dualnet"])
+  eq(providers.length, 3)
+  eq(providers.map(p => p.name), ["aaa-local", "dualnet", "unmetered"])
+  eq(providers.filter(p => p.name === "unmetered")[0].hasQuota, false)
 })
 
 test("parseProviders sums upload and download into used, with a bounded ratio", () => {
@@ -470,6 +477,48 @@ test("subscriptionRows carries the ratio and marks only HTTP providers updatable
   eq(dualnet.used, "3.91 KB")
   eq(dualnet.updatable, true)
   eq(local.updatable, false)
+})
+
+test("managed provider names accept comma and newline lists without duplicates", () => {
+  eq(Clash.parseManagedProviders("dualnet, aaa-local\ndualnet"), ["dualnet", "aaa-local"])
+  const selected = Clash.filterProviders(Clash.parseProviders(PROVIDERS_RAW), "dualnet,aaa-local")
+  eq(selected.map(p => p.name), ["dualnet", "aaa-local"])
+})
+
+test("observeUsage persists only quota counters and avoids duplicate samples", () => {
+  const providers = Clash.parseProviders(PROVIDERS_RAW)
+  const first = Clash.observeUsage(null, providers, 1000000, 30)
+  eq(Object.keys(first.providers), ["aaa-local", "dualnet"])
+  const second = Clash.observeUsage(first, providers, 1001000, 30)
+  eq(second.providers.dualnet.length, 1)
+})
+
+test("quotaForecast estimates exhaustion from the current monotonic cycle", () => {
+  const provider = {
+    name: "dualnet", hasQuota: true, used: 600, total: 1000,
+    expire: 20 * 86400000, ratio: 0.6
+  }
+  const history = { version: 1, providers: { dualnet: [
+    { at: 0, used: 100, total: 1000, expire: provider.expire },
+    { at: 5 * 86400000, used: 600, total: 1000, expire: provider.expire }
+  ] } }
+  const forecast = Clash.quotaForecast(provider, history, 5 * 86400000)
+  eq(forecast.known, true)
+  eq(forecast.confidence, "high")
+  eq(forecast.risk, true)
+  eq(Math.round((forecast.exhaustAt - 5 * 86400000) / 86400000), 4)
+})
+
+test("quotaForecast refuses to mix samples across a quota reset", () => {
+  const provider = { name: "p", hasQuota: true, used: 10, total: 100, expire: 0 }
+  const history = { version: 1, providers: { p: [
+    { at: 0, used: 90, total: 100 },
+    { at: 86400000, used: 5, total: 100 },
+    { at: 2 * 86400000, used: 10, total: 100 }
+  ] } }
+  const forecast = Clash.quotaForecast(provider, history, 2 * 86400000)
+  eq(forecast.known, true)
+  eq(Math.round((forecast.exhaustAt - 2 * 86400000) / 86400000), 18)
 })
 
 // ── Latency probes ──────────────────────────────────────────────────────────
