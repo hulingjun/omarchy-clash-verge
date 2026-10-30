@@ -131,6 +131,49 @@ function buildStatusCommand(cfg, groupName, deep, withTraffic) {
   return ["bash", "-c", script]
 }
 
+// Probe individual proxies instead of /group/<name>/delay. Mihomo's group
+// endpoint clears the fixed selection on Fallback/URLTest groups, which makes
+// a supposedly read-only scan change the user's route. Six concurrent curls
+// keep a typical provider scan quick without creating a connection burst.
+function buildIndependentDelayCommand(cfg, providerName, nodeNames, url, expected, timeoutMs) {
+  var provider = String(providerName || "")
+  var nodes = Array.isArray(nodeNames) ? nodeNames : []
+  var target = String(url || "")
+  var status = String(expected || "*")
+  var timeout = Number(timeoutMs || 6000)
+  if (!isFinite(timeout) || timeout < 1) timeout = 6000
+  var curlTimeout = Math.max(2, Math.ceil(timeout / 1000) + 2)
+  var script = "d=$(mktemp -d /tmp/omarchy-clash-chatgpt.XXXXXX) || exit 1\n"
+    + "cleanup(){ find \"$d\" -maxdepth 1 -type f -delete; rmdir \"$d\"; }\n"
+    + "trap cleanup EXIT\n"
+  var flags = curlArgsShell(cfg)
+
+  for (var i = 0; i < nodes.length; i++) {
+    var name = String(nodes[i] || "")
+    var path = "/providers/proxies/" + encodeURIComponent(provider) + "/"
+      + encodeURIComponent(name) + "/healthcheck?url="
+      + encodeURIComponent(target) + "&timeout=" + encodeURIComponent(String(timeout))
+      + "&expected=" + encodeURIComponent(status)
+    var detailsPath = "/providers/proxies/" + encodeURIComponent(provider) + "/"
+      + encodeURIComponent(name)
+    var output = "$d/" + String(i) + ".json"
+    script += "( curl -s --max-time " + String(curlTimeout) + " " + flags + " "
+      + Shared.shq(apiUrl(cfg, path)) + " >/dev/null; "
+      + "curl -s --max-time 4 " + flags + " " + Shared.shq(apiUrl(cfg, detailsPath))
+      + " | jq -c --arg key " + Shared.shq(name) + " --arg url " + Shared.shq(target)
+      + " 'if (.extra[$url].alive == true) then {($key): (([.extra[$url].history[]?.delay]"
+      + " | map(select(. > 0)) | last) // 0)} else {} end'"
+      + " 2>/dev/null > \"" + output + "\"; test -s \"" + output
+      + "\" || printf '{}\\n' > \"" + output + "\" ) &\n"
+    if ((i + 1) % 6 === 0) script += "wait\n"
+  }
+  script += "wait\n"
+  script += nodes.length > 0
+    ? "jq -sc 'add // {}' \"$d\"/*.json\n"
+    : "printf '{}\\n'\n"
+  return ["bash", "-c", script]
+}
+
 // curl's own exit code for the first request of the batch, which is the one
 // that decides whether the daemon is there at all. v1.0.0 threw this away and
 // reported every failure as "Clash Verge isn't running", including the cases
@@ -334,6 +377,15 @@ function parseProviders(raw) {
     var total = hasQuota ? Number(info.Total || 0) : 0
     var upload = hasQuota ? Number(info.Upload || 0) : 0
     var download = hasQuota ? Number(info.Download || 0) : 0
+    var nodeNames = []
+    var providerNodes = Array.isArray(entry.proxies) ? entry.proxies : []
+    for (var i = 0; i < providerNodes.length; i++) {
+      var providerNode = providerNodes[i]
+      var nodeName = typeof providerNode === "string" ? providerNode
+        : (providerNode && typeof providerNode === "object" ? providerNode.name : "")
+      nodeName = String(nodeName || "")
+      if (nodeName !== "" && nodeNames.indexOf(nodeName) === -1) nodeNames.push(nodeName)
+    }
     out.push({
       name: String(name),
       vehicleType: vehicleType,
@@ -344,7 +396,8 @@ function parseProviders(raw) {
       total: total,
       expire: hasQuota ? Shared.parseTime(Number(info.Expire || 0)) : 0,
       ratio: hasQuota ? Math.max(0, Math.min(1, (upload + download) / total)) : 0,
-      hasQuota: hasQuota
+      hasQuota: hasQuota,
+      nodes: nodeNames
     })
   }
   out.sort(function(a, b) { return a.name < b.name ? -1 : (a.name > b.name ? 1 : 0) })
@@ -372,6 +425,38 @@ function filterProviders(providers, managed) {
   for (var i = 0; i < list.length; i++) byName[list[i].name] = list[i]
   var out = []
   for (var j = 0; j < names.length; j++) if (byName[names[j]]) out.push(byName[names[j]])
+  return out
+}
+
+function providerNodeNames(providers, providerName) {
+  var wanted = String(providerName || "")
+  for (var i = 0; i < (providers || []).length; i++) {
+    var provider = providers[i]
+    if (provider && provider.name === wanted) {
+      return Array.isArray(provider.nodes) ? provider.nodes.slice() : []
+    }
+  }
+  return []
+}
+
+// Turns a batch probe's successful answers into a compact, fastest-first
+// picker. Missing entries are failures and deliberately stay out of the list:
+// this view is for choosing a route that reached the target, not diagnosing
+// every way a route can fail.
+function successfulProbeRows(nodeNames, delays) {
+  var out = []
+  var values = delays && typeof delays === "object" ? delays : {}
+  for (var i = 0; i < (nodeNames || []).length; i++) {
+    var name = String(nodeNames[i] || "")
+    var delay = Number(values[name] || 0)
+    if (name !== "" && isFinite(delay) && delay > 0) {
+      out.push({ key: name, label: name, delay: delay, order: i })
+    }
+  }
+  out.sort(function(a, b) {
+    if (a.delay !== b.delay) return a.delay - b.delay
+    return a.order - b.order
+  })
   return out
 }
 
@@ -756,6 +841,7 @@ if (typeof module !== "undefined") {
     curlArgsShell: curlArgsShell,
     apiUrl: apiUrl,
     buildStatusCommand: buildStatusCommand,
+    buildIndependentDelayCommand: buildIndependentDelayCommand,
     parseExitCode: parseExitCode,
     describeCurlError: describeCurlError,
     parseClashConfigs: parseClashConfigs,
@@ -771,6 +857,8 @@ if (typeof module !== "undefined") {
     parseProviders: parseProviders,
     parseManagedProviders: parseManagedProviders,
     filterProviders: filterProviders,
+    providerNodeNames: providerNodeNames,
+    successfulProbeRows: successfulProbeRows,
     parseUsageHistory: parseUsageHistory,
     observeUsage: observeUsage,
     quotaForecast: quotaForecast,

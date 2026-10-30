@@ -48,6 +48,16 @@ Panel {
     return isFinite(n) && n >= 7 ? n : 30
   }
   readonly property bool recoverOnNetworkChange: String(root.setting("recoverOnNetworkChange", "On")).toLowerCase() !== "off"
+  readonly property string chatgptProviderName: String(root.setting("chatgptProvider", "cdpc")).trim() || "cdpc"
+  readonly property string chatgptGroupName: String(root.setting("chatgptGroup", "OPENAI")).trim() || "OPENAI"
+  readonly property string chatgptTestUrl: {
+    var value = String(root.setting("chatgptTestUrl", "https://api.openai.com/v1/models")).trim()
+    return /^https?:\/\//.test(value) ? value : "https://api.openai.com/v1/models"
+  }
+  readonly property string chatgptExpectedStatus: {
+    var value = String(root.setting("chatgptExpectedStatus", "401")).trim()
+    return /^[0-9*/-]+$/.test(value) ? value : "401"
+  }
   readonly property string stateDir: (Quickshell.env("XDG_STATE_HOME") || Quickshell.env("HOME") + "/.local/state")
     + "/omarchy/clash-verge-plus"
   readonly property string historyPath: root.stateDir + "/quota-history.json"
@@ -93,6 +103,10 @@ Panel {
   property string actionStatus: ""
   property int cursorIndex: -1
   property bool testing: false
+  property bool chatgptTesting: false
+  property bool chatgptScanCompleted: false
+  property var chatgptResults: []
+  property string chatgptSelectedNode: ""
   property double providersFetchedAt: 0
 
   // -1 follows the daemon; 0/1 overrides it while a switch/mode change is in
@@ -128,6 +142,7 @@ Panel {
   readonly property var targets: Clash.clashTargets(root.state, root.filter, root.sortMode)
   readonly property var subscriptions: Clash.subscriptionRows(root.providers, root.nowMillis,
                                                                  root.usageHistory, root.quotaForecastEnabled)
+  readonly property var chatgptProviderNodes: Clash.providerNodeNames(root.providers, root.chatgptProviderName)
   readonly property string visibleError: root.lastError !== "" ? root.lastError : root.statusError
   readonly property string emptyText: !root.loaded
     ? "Checking…"
@@ -227,6 +242,10 @@ Panel {
     if (proxies.loaded) {
       root.nodes = proxies.nodes
       root.groupChoices = Clash.selectableGroups(proxies, root.activeGroupName)
+    }
+
+    if (root.resolved && root.resolved.groupName === root.chatgptGroupName) {
+      root.chatgptSelectedNode = Clash.activeNodeName({ group: root.resolved.group })
     }
 
     var net = Clash.parseConnections(Clash.batchSlot(parts, Clash.SLOT_CONNECTIONS))
@@ -366,6 +385,31 @@ Panel {
     nodeTestProc.running = true
   }
 
+  function testChatgptNodes() {
+    if (chatgptTestProc.running || root.chatgptProviderNodes.length === 0) return
+    clearError()
+    root.chatgptTesting = true
+    root.chatgptScanCompleted = false
+    root.chatgptResults = []
+    root.actionStatus = "Testing " + root.chatgptProviderNodes.length + " "
+      + root.chatgptProviderName + " nodes for ChatGPT…"
+    chatgptTestProc.probed = root.chatgptProviderNodes.slice()
+    chatgptTestProc.command = Clash.buildIndependentDelayCommand(root.api,
+      root.chatgptProviderName, chatgptTestProc.probed,
+      root.chatgptTestUrl, root.chatgptExpectedStatus, 6000)
+    chatgptTestProc.running = true
+  }
+
+  function selectChatgptNode(name) {
+    if (chatgptSelectProc.running || String(name || "") === "") return
+    clearError()
+    chatgptSelectProc.nodeName = String(name)
+    root.actionStatus = "Routing ChatGPT through " + name + "…"
+    chatgptSelectProc.command = httpCommand("PUT", "/proxies/" + encodeURIComponent(root.chatgptGroupName),
+                                            { name: String(name) })
+    chatgptSelectProc.running = true
+  }
+
   // ~295 KB on a config with providers, because mihomo inlines every proxy of
   // every provider into the response. On demand and throttled, never polled.
   function loadProviders(force) {
@@ -496,6 +540,8 @@ Panel {
     function refreshNow(): void { root.refresh() }
     function refreshSubscriptions(): void { root.updateAllProviders() }
     function recoverNetwork(): void { root.recoverAfterNetworkChange() }
+    function testChatgpt(): void { root.testChatgptNodes() }
+    function chatgpt(name: string): void { root.selectChatgptNode(String(name)) }
     function bypass(): void { root.setMode("direct") }
     function restore(): void { root.setMode("rule") }
     function toggleProxy(): void { root.toggleConnection() }
@@ -586,6 +632,50 @@ Panel {
       if (result.ok) delays[nodeTestProc.nodeName] = result.delay
       root.nodes = Clash.mergeDelays(root.nodes, delays, [nodeTestProc.nodeName])
       if (!result.ok) root.setError(nodeTestProc.nodeName + ": " + result.error)
+    }
+  }
+
+  Process {
+    id: chatgptTestProc
+    running: false
+    command: []
+    property var probed: []
+    stdout: StdioCollector { id: chatgptTestStdout; waitForEnd: true }
+    onExited: function(exitCode) {
+      var result = Clash.parseDelayMap(String(chatgptTestStdout.text || ""))
+      root.chatgptTesting = false
+      root.chatgptScanCompleted = true
+      root.actionStatus = ""
+      if (!result.ok) {
+        root.chatgptResults = []
+        root.setError("ChatGPT scan failed: " + result.error)
+        return
+      }
+      root.chatgptResults = Clash.successfulProbeRows(chatgptTestProc.probed, result.delays)
+      root.nodes = Clash.mergeDelays(root.nodes, result.delays, chatgptTestProc.probed)
+      if (root.chatgptResults.length === 0) {
+        root.setError("No " + root.chatgptProviderName + " node reached ChatGPT")
+      }
+    }
+  }
+
+  Process {
+    id: chatgptSelectProc
+    running: false
+    command: []
+    property string nodeName: ""
+    stdout: StdioCollector { id: chatgptSelectStdout; waitForEnd: true }
+    onExited: function(exitCode) {
+      var code = String(chatgptSelectStdout.text || "").trim()
+      root.actionStatus = ""
+      if (code !== "200" && code !== "204") {
+        root.setError("Could not use that node for " + root.chatgptGroupName
+                      + " (HTTP " + (code || "?") + ")")
+      } else {
+        root.chatgptSelectedNode = chatgptSelectProc.nodeName
+      }
+      root.invalidateDeep()
+      root.refresh()
     }
   }
 
@@ -765,6 +855,7 @@ Panel {
       onTextKey: function(t) {
         if (t === "r" || t === "R") root.refresh()
         else if (t === "t" || t === "T") root.testAll()
+        else if (t === "c" || t === "C") root.testChatgptNodes()
         else if (t === "s" || t === "S") root.cycleSort()
         else if (t === "b" || t === "B") root.toggleConnection()
         else if (t === "/") filterField.forceActiveFocus()
@@ -951,6 +1042,115 @@ Panel {
           options: root.groupChoices
           fontFamily: root.fontFamily
           onChanged: function(v) { root.selectGroup(v) }
+        }
+
+        // ── ChatGPT route assistant ──
+        // The provider may contain many regions and the user should not have
+        // to know which country names happen to work. This probes every member
+        // of the configured provider against ChatGPT without changing routes,
+        // then offers only the successful answers as one-click OPENAI picks.
+        ColumnLayout {
+          visible: root.chatgptProviderNodes.length > 0
+          Layout.fillWidth: true
+          spacing: Style.space(4)
+
+          PanelSeparator { Layout.fillWidth: true; foreground: root.fg }
+
+          RowLayout {
+            Layout.fillWidth: true
+            spacing: Style.space(6)
+
+            ColumnLayout {
+              Layout.fillWidth: true
+              spacing: 0
+              Text {
+                text: root.chatgptProviderName.toUpperCase() + " → ChatGPT"
+                color: root.fg
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                font.bold: true
+              }
+              Text {
+                text: root.chatgptTesting
+                  ? "Testing " + root.chatgptProviderNodes.length + " nodes without switching…"
+                  : (root.chatgptScanCompleted
+                    ? root.chatgptResults.length + " of " + root.chatgptProviderNodes.length + " passed the OpenAI check"
+                    : "Scan first; then click a passing node to route only ChatGPT")
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideRight
+                Layout.fillWidth: true
+              }
+            }
+
+            Button {
+              text: root.chatgptTesting ? "Scanning…" : (root.chatgptScanCompleted ? "Scan again" : "Scan")
+              enabled: root.reachable && !root.chatgptTesting && !chatgptSelectProc.running
+              opacity: enabled ? 1 : 0.5
+              foreground: root.okColor
+              tooltipText: "Test every " + root.chatgptProviderName
+                + " node against ChatGPT without changing your current route (c)"
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              horizontalPadding: Style.space(7)
+              verticalPadding: Style.space(3)
+              onClicked: root.testChatgptNodes()
+            }
+          }
+
+          Flickable {
+            visible: root.chatgptResults.length > 0
+            Layout.fillWidth: true
+            implicitHeight: Math.min(chatgptResultColumn.implicitHeight, Style.space(170))
+            contentHeight: chatgptResultColumn.implicitHeight
+            clip: true
+            boundsBehavior: Flickable.StopAtBounds
+
+            ColumnLayout {
+              id: chatgptResultColumn
+              width: parent.width
+              spacing: Style.space(3)
+
+              Repeater {
+                model: root.chatgptResults
+                delegate: RowLayout {
+                  required property var modelData
+                  Layout.fillWidth: true
+                  spacing: Style.space(6)
+
+                  Text {
+                    text: modelData.label
+                    color: modelData.key === root.chatgptSelectedNode ? root.okColor : root.fg
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    font.bold: modelData.key === root.chatgptSelectedNode
+                    elide: Text.ElideRight
+                    Layout.fillWidth: true
+                  }
+                  Text {
+                    text: Shared.formatDelay(modelData.delay)
+                    color: modelData.delay < 150 ? root.okColor
+                         : (modelData.delay < 400 ? root.warnColor : root.badColor)
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+                  Button {
+                    text: modelData.key === root.chatgptSelectedNode ? "Using" : "Use"
+                    enabled: !chatgptSelectProc.running && modelData.key !== root.chatgptSelectedNode
+                    opacity: enabled ? 1 : 0.6
+                    foreground: modelData.key === root.chatgptSelectedNode ? root.okColor : root.fg
+                    tooltipText: "Route " + root.chatgptGroupName + " through this node"
+                    fontFamily: root.fontFamily
+                    fontSize: Style.font.caption
+                    horizontalPadding: Style.space(6)
+                    verticalPadding: Style.space(1)
+                    onClicked: root.selectChatgptNode(modelData.key)
+                  }
+                }
+              }
+            }
+          }
         }
 
         // ── Toggles ──
@@ -1221,7 +1421,7 @@ Panel {
         // ── Footer ──
         Text {
           Layout.fillWidth: true
-          text: "click switches · right-click tests one · j/k move · t tests all · s sorts · b bypasses · / searches"
+          text: "click switches · right-click tests one · c scans ChatGPT · t tests all · s sorts · b bypasses · / searches"
           color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.3)
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption

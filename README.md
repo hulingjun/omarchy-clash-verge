@@ -21,7 +21,11 @@ enough model that it didn't make sense as a fifth backend bolted onto that
 project's `VpnController` — see `model/Clash.js`'s header comment for the
 longer version.
 
-## What this fork adds in 1.2.0
+## What this fork adds in 1.3.0
+
+- Adds a **CDPC → ChatGPT** route assistant that probes every node in a
+  configured provider without changing the active route, shows only successful
+  nodes in latency order, and assigns one to the `OPENAI` group with one click.
 
 - Lists every managed HTTP and File provider, including quota-free fallback
   providers, with per-provider and **Refresh all** actions.
@@ -88,6 +92,9 @@ URL and secret settings below. This widget:
   demand and throttled, because it is by far the largest document
 - `GET /group/<group>/delay` — probes every node in the group with one
   request (the Test all button)
+- `GET /providers/proxies/<provider>/<node>/healthcheck` — the ChatGPT
+  assistant probes provider nodes independently and in parallel so scanning
+  cannot clear a Fallback group's manual selection
 - `GET /proxies/<node>/delay` — probes a single node (right-click on a row)
 - `PUT /proxies/<group>` — switches the active node, or pins one in an
   auto-selecting group
@@ -144,6 +151,10 @@ ever talked to Clash Verge's API, never to its config files.
 | Quota exhaustion forecast | `On` | Persist quota-only history and estimate exhaustion. |
 | Quota history retention | `30` | History retention in days. Resets start a new prediction cycle. |
 | Recover after network changes | `On` | Close stale connections and health-check providers when the default route changes. |
+| ChatGPT scan provider | `cdpc` | Provider whose nodes appear in the ChatGPT route assistant. |
+| ChatGPT routing group | `OPENAI` | Group changed by the assistant's **Use** buttons. |
+| ChatGPT connectivity test URL | `https://api.openai.com/v1/models` | Per-node reachability target; no API key is sent. |
+| ChatGPT expected HTTP status | `401` | A normal no-credential OpenAI response passes, while a blocked region returns a different status. Mihomo status expressions such as `200/204` and `200-299` are also supported. |
 | Default group | `主代理` | The proxy group the widget steers when it opens. Every other group in your config is one pick away in the panel's group dropdown, so this is only the starting point. Falls back to `GLOBAL` if this name isn't in your config. |
 | Bar label | `Icon` | Icon shows the shield alone. Node adds the active outbound node's name. Speed shows live up/down throughput, which also makes the widget poll `/connections` while closed. |
 | Node order | `Config` | How the node list is sorted when the panel opens: Config keeps your config's order, Latency puts fastest first, Name sorts alphabetically. Press `s` in the panel to cycle it without changing this. |

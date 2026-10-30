@@ -437,7 +437,8 @@ const PROVIDERS_RAW = JSON.stringify({
     "dualnet": {
       vehicleType: "HTTP",
       updatedAt: "2026-08-24T06:55:28.369401126+08:00",
-      subscriptionInfo: { Upload: 1000, Download: 3000, Total: 10000, Expire: 1819723890 }
+      subscriptionInfo: { Upload: 1000, Download: 3000, Total: 10000, Expire: 1819723890 },
+      proxies: [{ name: "dual-a" }, { name: "dual-b" }, { name: "dual-a" }]
     },
     "aaa-local": {
       vehicleType: "File",
@@ -483,6 +484,38 @@ test("managed provider names accept comma and newline lists without duplicates",
   eq(Clash.parseManagedProviders("dualnet, aaa-local\ndualnet"), ["dualnet", "aaa-local"])
   const selected = Clash.filterProviders(Clash.parseProviders(PROVIDERS_RAW), "dualnet,aaa-local")
   eq(selected.map(p => p.name), ["dualnet", "aaa-local"])
+})
+
+test("providerNodeNames exposes unique provider members", () => {
+  const providers = Clash.parseProviders(PROVIDERS_RAW)
+  eq(Clash.providerNodeNames(providers, "dualnet"), ["dual-a", "dual-b"])
+  eq(Clash.providerNodeNames(providers, "missing"), [])
+})
+
+test("successfulProbeRows keeps only successful provider nodes and sorts by latency", () => {
+  eq(Clash.successfulProbeRows(["slow", "dead", "fast"], { slow: 350, fast: 82, other: 1 }), [
+    { key: "fast", label: "fast", delay: 82, order: 2 },
+    { key: "slow", label: "slow", delay: 350, order: 0 }
+  ])
+})
+
+test("independent ChatGPT probe avoids the group-delay route mutation", () => {
+  const command = Clash.buildIndependentDelayCommand(
+    Clash.apiConfig("", "http://127.0.0.1:9090", ""),
+    "cdpc",
+    ["CDPC Hong Kong", "CDPC O'Brien"],
+    "https://api.openai.com/v1/models",
+    "401",
+    6000
+  )
+  eq(command[0], "bash")
+  eq(command[1], "-c")
+  ok(command[2].includes("/providers/proxies/cdpc/CDPC%20Hong%20Kong/healthcheck"))
+  ok(command[2].includes("/providers/proxies/cdpc/CDPC%20O"))
+  ok(command[2].includes("Brien/healthcheck"))
+  ok(command[2].includes("expected=401"))
+  ok(command[2].includes(".extra[$url].alive == true"))
+  ok(!command[2].includes("/group/"))
 })
 
 test("observeUsage persists only quota counters and avoids duplicate samples", () => {
