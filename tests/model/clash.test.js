@@ -492,6 +492,29 @@ test("providerNodeNames exposes unique provider members", () => {
   eq(Clash.providerNodeNames(providers, "missing"), [])
 })
 
+test("providerNodeRows unifies nodes with their subscription source", () => {
+  const providers = Clash.parseProviders(PROVIDERS_RAW)
+  eq(Clash.providerNodeRows(providers, ["dualnet"]), [
+    { key: "dual-a", label: "dual-a", provider: "dualnet", order: 0 },
+    { key: "dual-b", label: "dual-b", provider: "dualnet", order: 1 }
+  ])
+  eq(Clash.providerForNode(Clash.providerNodeRows(providers, "dualnet"), "dual-b"), "dualnet")
+})
+
+test("successfulProviderProbeRows keeps provider identity and counts passes", () => {
+  const candidates = [
+    { key: "slow", label: "slow", provider: "a", order: 0 },
+    { key: "fast", label: "fast", provider: "b", order: 1 }
+  ]
+  const rows = Clash.successfulProviderProbeRows(candidates, { slow: 300, fast: 70 })
+  eq(rows, [
+    { key: "fast", label: "fast", provider: "b", delay: 70, order: 1 },
+    { key: "slow", label: "slow", provider: "a", delay: 300, order: 0 }
+  ])
+  eq(Clash.providerPassCount(rows, "a"), 1)
+  eq(Clash.providerPassCount(rows, "missing"), 0)
+})
+
 test("successfulProbeRows keeps only successful provider nodes and sorts by latency", () => {
   eq(Clash.successfulProbeRows(["slow", "dead", "fast"], { slow: 350, fast: 82, other: 1 }), [
     { key: "fast", label: "fast", delay: 82, order: 2 },
@@ -502,8 +525,10 @@ test("successfulProbeRows keeps only successful provider nodes and sorts by late
 test("independent ChatGPT probe avoids the group-delay route mutation", () => {
   const command = Clash.buildIndependentDelayCommand(
     Clash.apiConfig("", "http://127.0.0.1:9090", ""),
-    "cdpc",
-    ["CDPC Hong Kong", "CDPC O'Brien"],
+    [
+      { provider: "cdpc", key: "CDPC Hong Kong" },
+      { provider: "cdpc", key: "CDPC O'Brien" }
+    ],
     "https://api.openai.com/v1/models",
     "401",
     6000

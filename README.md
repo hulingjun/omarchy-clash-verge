@@ -21,11 +21,16 @@ enough model that it didn't make sense as a fifth backend bolted onto that
 project's `VpnController` — see `model/Clash.js`'s header comment for the
 longer version.
 
-## What this fork adds in 1.3.0
+## What this fork adds in 2.0.0
 
-- Adds a **CDPC → ChatGPT** route assistant that probes every node in a
-  configured provider without changing the active route, shows only successful
-  nodes in latency order, and assigns one to the `OPENAI` group with one click.
+- Reframes the panel around a unified **ChatGPT routes / Subscriptions** flow:
+  every managed subscription contributes candidates to one availability scan,
+  passing nodes keep their source label, and advanced Clash controls stay
+  available without competing with the primary route workflow.
+
+- Uses provider-scoped parallel health checks, so testing every subscription
+  never clears the active `Fallback` pin; only verified nodes appear in the
+  unified route list, sorted by latency.
 
 - Lists every managed HTTP and File provider, including quota-free fallback
   providers, with per-provider and **Refresh all** actions.
@@ -151,7 +156,7 @@ ever talked to Clash Verge's API, never to its config files.
 | Quota exhaustion forecast | `On` | Persist quota-only history and estimate exhaustion. |
 | Quota history retention | `30` | History retention in days. Resets start a new prediction cycle. |
 | Recover after network changes | `On` | Close stale connections and health-check providers when the default route changes. |
-| ChatGPT scan provider | `cdpc` | Provider whose nodes appear in the ChatGPT route assistant. |
+| ChatGPT scan subscriptions | empty (all managed) | Comma-separated providers included in the unified ChatGPT route scan. |
 | ChatGPT routing group | `OPENAI` | Group changed by the assistant's **Use** buttons. |
 | ChatGPT connectivity test URL | `https://api.openai.com/v1/models` | Per-node reachability target; no API key is sent. |
 | ChatGPT expected HTTP status | `401` | A normal no-credential OpenAI response passes, while a blocked region returns a different status. Mihomo status expressions such as `200/204` and `200-299` are also supported. |

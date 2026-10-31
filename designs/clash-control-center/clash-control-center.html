@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,">
+  <title>Clash Control Center</title>
+  <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+  <style>
+    :root {
+      color-scheme: dark;
+      --page: #0f1018;
+      --panel: #171824;
+      --surface: #1d1f2d;
+      --surface-strong: #242638;
+      --line: #34364a;
+      --line-soft: #292b3b;
+      --text: #e7e8f3;
+      --muted: #999fbe;
+      --faint: #6f7595;
+      --green: #36d17b;
+      --green-soft: rgba(54, 209, 123, .11);
+      --amber: #f2bd4b;
+      --red: #f16c7f;
+      --accent: #9d8cff;
+      --font: "JetBrainsMono Nerd Font", "Noto Sans Mono CJK SC", "Noto Sans SC", monospace;
+    }
+    * { box-sizing: border-box; }
+    html, body, #root { min-height: 100%; margin: 0; }
+    body {
+      background: var(--page);
+      color: var(--text);
+      font-family: var(--font);
+      display: grid;
+      place-items: start center;
+      padding: 24px;
+    }
+    button { font: inherit; }
+    .panel {
+      width: min(460px, calc(100vw - 24px));
+      min-height: 760px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      box-shadow: 0 18px 60px rgba(0,0,0,.32);
+      padding: 16px;
+    }
+    .header, .row, .actions, .tabs, .node-main, .provider-head, .advanced-head {
+      display: flex;
+      align-items: center;
+    }
+    .header { gap: 10px; padding-bottom: 13px; border-bottom: 1px solid var(--line-soft); }
+    .mark {
+      width: 17px; height: 19px; border: 2px solid #b9c3ff; border-radius: 7px 7px 9px 9px;
+      position: relative; opacity: .95;
+    }
+    .mark::after { content: ""; position: absolute; inset: 4px; background: var(--green); border-radius: 50%; }
+    .title { font-size: 15px; font-weight: 750; letter-spacing: .02em; flex: 1; }
+    .live { color: var(--muted); font-size: 11px; }
+    .live::before { content: ""; display: inline-block; width: 6px; height: 6px; margin-right: 6px; border-radius: 50%; background: var(--green); }
+    .text-button, .button, .tab {
+      border: 1px solid transparent;
+      color: var(--muted);
+      background: transparent;
+      cursor: pointer;
+      transition: background .15s ease, border-color .15s ease, color .15s ease;
+    }
+    .text-button { padding: 5px 6px; font-size: 11px; }
+    .text-button:hover { color: var(--text); }
+    .hero { padding: 17px 0 15px; border-bottom: 1px solid var(--line-soft); }
+    .eyebrow { color: var(--muted); font-size: 11px; margin-bottom: 8px; }
+    .route-line { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: start; }
+    .route-name { font-size: 16px; font-weight: 750; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .route-name span { color: var(--green); margin-right: 7px; }
+    .route-meta { color: var(--muted); font-size: 11px; margin-top: 6px; line-height: 1.6; }
+    .route-state { color: var(--green); background: var(--green-soft); border: 1px solid rgba(54,209,123,.3); font-size: 11px; padding: 4px 7px; }
+    .actions { gap: 8px; margin-top: 14px; }
+    .button { padding: 8px 11px; font-size: 11px; border-color: var(--line); background: var(--surface); color: var(--text); }
+    .button:hover { background: var(--surface-strong); border-color: #50536b; }
+    .button.primary { color: #08140e; border-color: var(--green); background: var(--green); font-weight: 750; }
+    .button.primary:hover { background: #55dc91; }
+    .button:disabled { cursor: default; opacity: .45; }
+    .tabs { gap: 0; margin: 15px 0 12px; border-bottom: 1px solid var(--line-soft); }
+    .tab { padding: 8px 11px 9px; font-size: 12px; border-bottom: 2px solid transparent; }
+    .tab.active { color: var(--text); border-bottom-color: var(--accent); }
+    .tab-count { color: var(--faint); margin-left: 5px; }
+    .section-note { color: var(--muted); font-size: 11px; line-height: 1.65; margin-bottom: 9px; }
+    .scan-line { display: flex; justify-content: space-between; gap: 10px; align-items: center; margin-bottom: 9px; }
+    .scan-summary { color: var(--muted); font-size: 11px; }
+    .scan-summary strong { color: var(--text); font-weight: 650; }
+    .node-list, .provider-list { display: grid; gap: 6px; }
+    .node {
+      border: 1px solid var(--line-soft);
+      background: rgba(255,255,255,.018);
+      padding: 9px 10px;
+      transition: background .15s ease, border-color .15s ease;
+    }
+    .node:hover { background: var(--surface); border-color: var(--line); }
+    .node.using { background: var(--green-soft); border-color: rgba(54,209,123,.35); }
+    .node-main { gap: 8px; }
+    .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); flex: 0 0 auto; }
+    .node-copy { min-width: 0; flex: 1; }
+    .node-name { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .node-sub { color: var(--faint); font-size: 10px; margin-top: 4px; }
+    .latency { color: var(--amber); font-size: 11px; min-width: 52px; text-align: right; }
+    .node.using .latency { color: var(--green); }
+    .use { min-width: 43px; text-align: center; }
+    .empty { border: 1px dashed var(--line); padding: 28px 18px; text-align: center; color: var(--muted); font-size: 11px; line-height: 1.7; }
+    .provider { border: 1px solid var(--line-soft); padding: 11px; background: rgba(255,255,255,.018); }
+    .provider-head { gap: 8px; }
+    .provider-name { font-size: 12px; font-weight: 700; flex: 1; }
+    .provider-type { color: var(--faint); font-size: 10px; border: 1px solid var(--line); padding: 2px 5px; }
+    .provider-stats { display: grid; grid-template-columns: 1fr auto; gap: 5px 10px; margin-top: 9px; color: var(--muted); font-size: 10px; line-height: 1.55; }
+    .provider-stats strong { color: var(--text); font-weight: 600; }
+    .quota { height: 3px; background: var(--line-soft); margin-top: 9px; overflow: hidden; }
+    .quota > span { display: block; height: 100%; background: var(--amber); }
+    .advanced { margin-top: 14px; border-top: 1px solid var(--line-soft); padding-top: 11px; }
+    .advanced-head { width: 100%; padding: 5px 0; color: var(--muted); background: none; border: 0; cursor: pointer; font: inherit; }
+    .advanced-head span:first-child { flex: 1; text-align: left; font-size: 11px; }
+    .advanced-body { display: grid; gap: 8px; padding-top: 9px; }
+    .setting { display: flex; justify-content: space-between; align-items: center; border: 1px solid var(--line-soft); padding: 9px 10px; font-size: 11px; color: var(--muted); }
+    .setting strong { color: var(--text); font-weight: 600; }
+    .spinner { display: inline-block; width: 9px; height: 9px; border: 1px solid rgba(8,20,14,.35); border-top-color: #08140e; border-radius: 50%; animation: spin .7s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @media (max-width: 520px) { body { padding: 0; } .panel { width: 100vw; min-height: 100vh; border: 0; } }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel" src="clash-control-center.jsx"></script>
+</body>
+</html>

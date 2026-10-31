@@ -48,7 +48,13 @@ Panel {
     return isFinite(n) && n >= 7 ? n : 30
   }
   readonly property bool recoverOnNetworkChange: String(root.setting("recoverOnNetworkChange", "On")).toLowerCase() !== "off"
-  readonly property string chatgptProviderName: String(root.setting("chatgptProvider", "cdpc")).trim() || "cdpc"
+  readonly property var chatgptProviderNames: {
+    if (settings && settings.chatgptProviders !== undefined) {
+      return Clash.parseManagedProviders(settings.chatgptProviders)
+    }
+    var legacy = String(root.setting("chatgptProvider", "")).trim()
+    return legacy === "" ? [] : [legacy]
+  }
   readonly property string chatgptGroupName: String(root.setting("chatgptGroup", "OPENAI")).trim() || "OPENAI"
   readonly property string chatgptTestUrl: {
     var value = String(root.setting("chatgptTestUrl", "https://api.openai.com/v1/models")).trim()
@@ -107,6 +113,8 @@ Panel {
   property bool chatgptScanCompleted: false
   property var chatgptResults: []
   property string chatgptSelectedNode: ""
+  property string mainView: "routes"
+  property bool advancedExpanded: false
   property double providersFetchedAt: 0
 
   // -1 follows the daemon; 0/1 overrides it while a switch/mode change is in
@@ -142,7 +150,10 @@ Panel {
   readonly property var targets: Clash.clashTargets(root.state, root.filter, root.sortMode)
   readonly property var subscriptions: Clash.subscriptionRows(root.providers, root.nowMillis,
                                                                  root.usageHistory, root.quotaForecastEnabled)
-  readonly property var chatgptProviderNodes: Clash.providerNodeNames(root.providers, root.chatgptProviderName)
+  readonly property var chatgptCandidates: Clash.providerNodeRows(root.providers, root.chatgptProviderNames)
+  readonly property var chatgptProviderNodes: root.chatgptCandidates.map(function(row) { return row.key })
+  readonly property string chatgptSelectedProvider: Clash.providerForNode(root.chatgptCandidates,
+                                                                           root.chatgptSelectedNode)
   readonly property string visibleError: root.lastError !== "" ? root.lastError : root.statusError
   readonly property string emptyText: !root.loaded
     ? "Checking…"
@@ -386,17 +397,15 @@ Panel {
   }
 
   function testChatgptNodes() {
-    if (chatgptTestProc.running || root.chatgptProviderNodes.length === 0) return
+    if (chatgptTestProc.running || root.chatgptCandidates.length === 0) return
     clearError()
     root.chatgptTesting = true
     root.chatgptScanCompleted = false
     root.chatgptResults = []
-    root.actionStatus = "Testing " + root.chatgptProviderNodes.length + " "
-      + root.chatgptProviderName + " nodes for ChatGPT…"
-    chatgptTestProc.probed = root.chatgptProviderNodes.slice()
+    root.actionStatus = "Testing " + root.chatgptCandidates.length + " nodes for ChatGPT…"
+    chatgptTestProc.probed = root.chatgptCandidates.slice()
     chatgptTestProc.command = Clash.buildIndependentDelayCommand(root.api,
-      root.chatgptProviderName, chatgptTestProc.probed,
-      root.chatgptTestUrl, root.chatgptExpectedStatus, 6000)
+      chatgptTestProc.probed, root.chatgptTestUrl, root.chatgptExpectedStatus, 6000)
     chatgptTestProc.running = true
   }
 
@@ -407,6 +416,15 @@ Panel {
     root.actionStatus = "Routing ChatGPT through " + name + "…"
     chatgptSelectProc.command = httpCommand("PUT", "/proxies/" + encodeURIComponent(root.chatgptGroupName),
                                             { name: String(name) })
+    chatgptSelectProc.running = true
+  }
+
+  function resetChatgptRoute() {
+    if (chatgptSelectProc.running) return
+    clearError()
+    chatgptSelectProc.nodeName = ""
+    root.actionStatus = "Restoring automatic ChatGPT routing…"
+    chatgptSelectProc.command = httpCommand("DELETE", "/proxies/" + encodeURIComponent(root.chatgptGroupName), null)
     chatgptSelectProc.running = true
   }
 
@@ -504,6 +522,7 @@ Panel {
       invalidateDeep()
       refresh()
       loadProviders(false)
+      chatgptAutoScanTimer.restart()
     } else {
       // Cleared imperatively, and the field's text along with it: a
       // declarative `text: root.filter` binding would be severed the moment
@@ -651,10 +670,11 @@ Panel {
         root.setError("ChatGPT scan failed: " + result.error)
         return
       }
-      root.chatgptResults = Clash.successfulProbeRows(chatgptTestProc.probed, result.delays)
-      root.nodes = Clash.mergeDelays(root.nodes, result.delays, chatgptTestProc.probed)
+      root.chatgptResults = Clash.successfulProviderProbeRows(chatgptTestProc.probed, result.delays)
+      root.nodes = Clash.mergeDelays(root.nodes, result.delays,
+        chatgptTestProc.probed.map(function(row) { return row.key }))
       if (root.chatgptResults.length === 0) {
-        root.setError("No " + root.chatgptProviderName + " node reached ChatGPT")
+        root.setError("No managed subscription node reached ChatGPT")
       }
     }
   }
@@ -690,6 +710,7 @@ Panel {
                                          root.managedProviderNames)
       root.providers = parsed
       root.providersFetchedAt = now
+      if (root.opened && !root.chatgptScanCompleted) chatgptAutoScanTimer.restart()
       if (root.quotaForecastEnabled) {
         root.usageHistory = Clash.observeUsage(root.usageHistory, parsed, now, root.quotaHistoryDays)
         historyFile.setText(JSON.stringify(root.usageHistory, null, 2) + "\n")
@@ -792,6 +813,16 @@ Panel {
   }
 
   Timer {
+    id: chatgptAutoScanTimer
+    interval: 150
+    repeat: false
+    onTriggered: {
+      if (root.opened && !root.chatgptTesting && !root.chatgptScanCompleted
+          && root.chatgptCandidates.length > 0) root.testChatgptNodes()
+    }
+  }
+
+  Timer {
     interval: root.refreshInterval * 1000
     running: true
     repeat: true
@@ -885,6 +916,7 @@ Panel {
           }
 
           Button {
+            visible: false
             text: root.testing ? "Testing…" : "Test all"
             enabled: root.reachable && root.resolved !== null && !root.testing
             opacity: enabled ? 1 : 0.5
@@ -915,6 +947,13 @@ Panel {
         ColumnLayout {
           Layout.fillWidth: true
           spacing: Style.space(3)
+
+          Text {
+            text: "CHATGPT CURRENT ROUTE"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
 
           RowLayout {
             Layout.fillWidth: true
@@ -950,7 +989,7 @@ Panel {
           }
 
           Repeater {
-            model: root.details
+            model: []
             delegate: RowLayout {
               required property var modelData
               Layout.fillWidth: true
@@ -975,7 +1014,7 @@ Panel {
           }
 
           Repeater {
-            model: root.networkRows
+            model: []
             delegate: RowLayout {
               required property var modelData
               Layout.fillWidth: true
@@ -1000,6 +1039,19 @@ Panel {
           }
 
           Text {
+            visible: root.reachable && root.chatgptSelectedNode !== ""
+            text: "Subscription " + (root.chatgptSelectedProvider || "unknown")
+              + " · " + (root.resolved && root.resolved.group.fixed !== "" ? "pinned" : "automatic")
+              + " · group " + root.chatgptGroupName
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            Layout.leftMargin: Style.space(28)
+            Layout.fillWidth: true
+            elide: Text.ElideRight
+          }
+
+          Text {
             visible: root.visibleError !== ""
             text: root.visibleError
             color: root.badColor
@@ -1016,26 +1068,55 @@ Panel {
             Layout.topMargin: Style.space(2)
             spacing: Style.space(6)
             Button {
-              text: root.connected ? "Bypass (direct)" : "Restore proxy"
-              foreground: root.connected ? root.badColor : root.okColor
-              tooltipText: "Toggle whether Clash routes anything at all (b)"
+              text: root.chatgptTesting ? "Scanning…" : "Scan all routes"
+              enabled: !root.chatgptTesting && root.chatgptCandidates.length > 0
+              foreground: root.okColor
+              tooltipText: "Check every managed subscription for ChatGPT-capable nodes (c)"
               fontFamily: root.fontFamily
               fontSize: Style.font.caption
               horizontalPadding: Style.space(8)
               verticalPadding: Style.space(3)
-              onClicked: root.toggleConnection()
+              onClicked: root.testChatgptNodes()
+            }
+            Button {
+              text: "Automatic"
+              enabled: root.resolved && root.resolved.group.fixed !== "" && !chatgptSelectProc.running
+              opacity: enabled ? 1 : 0.5
+              foreground: root.fg
+              tooltipText: "Remove the manual pin and let " + root.chatgptGroupName + " choose again"
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              horizontalPadding: Style.space(8)
+              verticalPadding: Style.space(3)
+              onClicked: root.resetChatgptRoute()
             }
           }
         }
 
         PanelSeparator { Layout.fillWidth: true; foreground: root.fg; visible: root.reachable }
 
+        ButtonGroup {
+          visible: root.reachable
+          Layout.fillWidth: true
+          value: root.mainView
+          options: [
+            { value: "routes", label: "ChatGPT routes  " + root.chatgptResults.length,
+              tooltip: "Only nodes that passed the OpenAI check" },
+            { value: "subscriptions", label: "Subscriptions  " + root.subscriptions.length,
+              tooltip: "Quota, refresh and ChatGPT availability by source" }
+          ]
+          foreground: root.fg
+          fontFamily: root.fontFamily
+          fontSize: Style.font.caption
+          onChanged: function(v) { root.mainView = v }
+        }
+
         // ── Group picker ──
         // v1.0.0 could only ever drive the one group named in settings. A real
         // config has a dozen — this machine's has fifteen — and which one you
         // want to steer changes with what you are doing.
         Dropdown {
-          visible: root.groupChoices.length > 1
+          visible: false
           Layout.fillWidth: true
           label: "Group"
           value: root.activeGroupName
@@ -1050,7 +1131,7 @@ Panel {
         // of the configured provider against ChatGPT without changing routes,
         // then offers only the successful answers as one-click OPENAI picks.
         ColumnLayout {
-          visible: root.chatgptProviderNodes.length > 0
+          visible: root.mainView === "routes" && root.chatgptCandidates.length > 0
           Layout.fillWidth: true
           spacing: Style.space(4)
 
@@ -1064,7 +1145,7 @@ Panel {
               Layout.fillWidth: true
               spacing: 0
               Text {
-                text: root.chatgptProviderName.toUpperCase() + " → ChatGPT"
+                text: "ChatGPT-capable routes"
                 color: root.fg
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
@@ -1075,7 +1156,7 @@ Panel {
                   ? "Testing " + root.chatgptProviderNodes.length + " nodes without switching…"
                   : (root.chatgptScanCompleted
                     ? root.chatgptResults.length + " of " + root.chatgptProviderNodes.length + " passed the OpenAI check"
-                    : "Scan first; then click a passing node to route only ChatGPT")
+                    : "All managed subscriptions, one availability check")
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
@@ -1089,8 +1170,7 @@ Panel {
               enabled: root.reachable && !root.chatgptTesting && !chatgptSelectProc.running
               opacity: enabled ? 1 : 0.5
               foreground: root.okColor
-              tooltipText: "Test every " + root.chatgptProviderName
-                + " node against ChatGPT without changing your current route (c)"
+              tooltipText: "Test every managed node against ChatGPT without changing your current route (c)"
               fontFamily: root.fontFamily
               fontSize: Style.font.caption
               horizontalPadding: Style.space(7)
@@ -1129,6 +1209,12 @@ Panel {
                     Layout.fillWidth: true
                   }
                   Text {
+                    text: modelData.provider
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+                  Text {
                     text: Shared.formatDelay(modelData.delay)
                     color: modelData.delay < 150 ? root.okColor
                          : (modelData.delay < 400 ? root.warnColor : root.badColor)
@@ -1155,7 +1241,7 @@ Panel {
 
         // ── Toggles ──
         Repeater {
-          model: root.reachable ? root.toggles : []
+          model: []
           delegate: Toggle {
             required property var modelData
             Layout.fillWidth: true
@@ -1171,7 +1257,7 @@ Panel {
 
         // ── Subscriptions ──
         RowLayout {
-          visible: root.subscriptions.length > 0
+          visible: root.mainView === "subscriptions" && root.subscriptions.length > 0
           Layout.fillWidth: true
           spacing: Style.space(6)
           Text {
@@ -1196,7 +1282,7 @@ Panel {
         }
 
         Repeater {
-          model: root.subscriptions
+          model: root.mainView === "subscriptions" ? root.subscriptions : []
           delegate: ColumnLayout {
             required property var modelData
             Layout.fillWidth: true
@@ -1212,6 +1298,12 @@ Panel {
                 font.pixelSize: Style.font.caption
                 elide: Text.ElideRight
                 Layout.fillWidth: true
+              }
+              Text {
+                text: modelData.vehicleType + " · " + modelData.nodeCount + " nodes"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
               }
               Text {
                 text: modelData.quotaText
@@ -1231,6 +1323,16 @@ Panel {
                 verticalPadding: Style.space(1)
                 onClicked: root.updateProvider(modelData.key)
               }
+            }
+
+            Text {
+              visible: root.chatgptScanCompleted
+              text: "ChatGPT available  " + Clash.providerPassCount(root.chatgptResults, modelData.key)
+                + " / " + modelData.nodeCount
+              color: Clash.providerPassCount(root.chatgptResults, modelData.key) > 0 ? root.okColor : root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              Layout.fillWidth: true
             }
 
             Text {
@@ -1261,9 +1363,78 @@ Panel {
           }
         }
 
+        PanelSeparator { Layout.fillWidth: true; foreground: root.fg }
+
+        RowLayout {
+          Layout.fillWidth: true
+          Text {
+            text: "Advanced network"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            Layout.fillWidth: true
+          }
+          Button {
+            text: root.advancedExpanded ? "Collapse" : "Expand"
+            foreground: root.dim
+            fontFamily: root.fontFamily
+            fontSize: Style.font.caption
+            horizontalPadding: Style.space(6)
+            verticalPadding: Style.space(1)
+            onClicked: root.advancedExpanded = !root.advancedExpanded
+          }
+        }
+
+        Dropdown {
+          visible: root.advancedExpanded && root.groupChoices.length > 1
+          Layout.fillWidth: true
+          label: "Group"
+          value: root.activeGroupName
+          options: root.groupChoices
+          fontFamily: root.fontFamily
+          onChanged: function(v) { root.selectGroup(v) }
+        }
+
+        Repeater {
+          model: root.advancedExpanded && root.reachable ? root.toggles : []
+          delegate: Toggle {
+            required property var modelData
+            Layout.fillWidth: true
+            label: modelData.label
+            description: modelData.detail
+            checked: modelData.value
+            foreground: root.fg
+            fontFamily: root.fontFamily
+            opacity: modelData.busy ? 0.6 : 1
+            onClicked: if (!modelData.busy) root.setToggle(modelData.key, !modelData.value)
+          }
+        }
+
+        RowLayout {
+          visible: root.advancedExpanded && root.reachable
+          Layout.fillWidth: true
+          Text {
+            text: root.networkRows.map(function(row) { return row.label + " " + row.value }).join("  ·  ")
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            elide: Text.ElideRight
+            Layout.fillWidth: true
+          }
+          Button {
+            text: root.connected ? "Bypass" : "Restore"
+            foreground: root.connected ? root.badColor : root.okColor
+            fontFamily: root.fontFamily
+            fontSize: Style.font.caption
+            horizontalPadding: Style.space(6)
+            verticalPadding: Style.space(1)
+            onClicked: root.toggleConnection()
+          }
+        }
+
         // ── Filter + sort ──
         RowLayout {
-          visible: root.reachable && root.resolved !== null
+          visible: root.advancedExpanded && root.reachable && root.resolved !== null
           Layout.fillWidth: true
           spacing: Style.space(6)
 
@@ -1295,7 +1466,7 @@ Panel {
 
         // ── Target list ──
         Text {
-          visible: root.targets.length === 0
+          visible: root.advancedExpanded && root.targets.length === 0
           Layout.fillWidth: true
           text: root.emptyText
           color: root.dim
@@ -1306,7 +1477,7 @@ Panel {
 
         Flickable {
           id: targetList
-          visible: root.targets.length > 0
+          visible: root.advancedExpanded && root.targets.length > 0
           Layout.fillWidth: true
           implicitHeight: Math.min(targetColumn.implicitHeight, Style.space(380))
           contentHeight: targetColumn.implicitHeight
@@ -1420,6 +1591,7 @@ Panel {
 
         // ── Footer ──
         Text {
+          visible: root.advancedExpanded
           Layout.fillWidth: true
           text: "click switches · right-click tests one · c scans ChatGPT · t tests all · s sorts · b bypasses · / searches"
           color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.3)

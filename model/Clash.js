@@ -135,9 +135,8 @@ function buildStatusCommand(cfg, groupName, deep, withTraffic) {
 // endpoint clears the fixed selection on Fallback/URLTest groups, which makes
 // a supposedly read-only scan change the user's route. Six concurrent curls
 // keep a typical provider scan quick without creating a connection burst.
-function buildIndependentDelayCommand(cfg, providerName, nodeNames, url, expected, timeoutMs) {
-  var provider = String(providerName || "")
-  var nodes = Array.isArray(nodeNames) ? nodeNames : []
+function buildIndependentDelayCommand(cfg, candidates, url, expected, timeoutMs) {
+  var nodes = Array.isArray(candidates) ? candidates : []
   var target = String(url || "")
   var status = String(expected || "*")
   var timeout = Number(timeoutMs || 6000)
@@ -149,7 +148,9 @@ function buildIndependentDelayCommand(cfg, providerName, nodeNames, url, expecte
   var flags = curlArgsShell(cfg)
 
   for (var i = 0; i < nodes.length; i++) {
-    var name = String(nodes[i] || "")
+    var candidate = nodes[i] || {}
+    var provider = String(candidate.provider || "")
+    var name = String(candidate.key || candidate.name || "")
     var path = "/providers/proxies/" + encodeURIComponent(provider) + "/"
       + encodeURIComponent(name) + "/healthcheck?url="
       + encodeURIComponent(target) + "&timeout=" + encodeURIComponent(String(timeout))
@@ -439,6 +440,65 @@ function providerNodeNames(providers, providerName) {
   return []
 }
 
+// A single ChatGPT route list spans every managed subscription. Provider
+// identity stays on each row so the UI can explain where a node came from and
+// the independent health-check command can use the provider-scoped API.
+function providerNodeRows(providers, providerNames) {
+  var wanted = Array.isArray(providerNames) ? providerNames : parseManagedProviders(providerNames)
+  var includeAll = wanted.length === 0
+  var allowed = {}
+  for (var i = 0; i < wanted.length; i++) allowed[wanted[i]] = true
+  var out = []
+  var seen = {}
+  for (var p = 0; p < (providers || []).length; p++) {
+    var provider = providers[p]
+    if (!provider || (!includeAll && !allowed[provider.name])) continue
+    for (var n = 0; n < (provider.nodes || []).length; n++) {
+      var name = String(provider.nodes[n] || "")
+      if (name === "" || seen[name]) continue
+      seen[name] = true
+      out.push({ key: name, label: name, provider: provider.name, order: out.length })
+    }
+  }
+  return out
+}
+
+function providerForNode(candidates, nodeName) {
+  var wanted = String(nodeName || "")
+  for (var i = 0; i < (candidates || []).length; i++) {
+    if (candidates[i] && candidates[i].key === wanted) return String(candidates[i].provider || "")
+  }
+  return ""
+}
+
+function successfulProviderProbeRows(candidates, delays) {
+  var out = []
+  var values = delays && typeof delays === "object" ? delays : {}
+  for (var i = 0; i < (candidates || []).length; i++) {
+    var candidate = candidates[i] || {}
+    var name = String(candidate.key || "")
+    var delay = Number(values[name] || 0)
+    if (name !== "" && isFinite(delay) && delay > 0) {
+      out.push({ key: name, label: String(candidate.label || name), provider: String(candidate.provider || ""),
+                 delay: delay, order: Number(candidate.order === undefined ? i : candidate.order) })
+    }
+  }
+  out.sort(function(a, b) {
+    if (a.delay !== b.delay) return a.delay - b.delay
+    return a.order - b.order
+  })
+  return out
+}
+
+function providerPassCount(results, providerName) {
+  var wanted = String(providerName || "")
+  var count = 0
+  for (var i = 0; i < (results || []).length; i++) {
+    if (results[i] && results[i].provider === wanted) count += 1
+  }
+  return count
+}
+
 // Turns a batch probe's successful answers into a compact, fastest-first
 // picker. Missing entries are failures and deliberately stay out of the list:
 // this view is for choosing a route that reached the target, not diagnosing
@@ -547,6 +607,8 @@ function subscriptionRows(providers, nowMillis, history, forecastEnabled) {
       expiry: Shared.formatUntil(p.expire, nowMillis),
       updated: Shared.formatSince(p.updatedAt, nowMillis),
       updatable: p.vehicleType === "HTTP",
+      vehicleType: p.vehicleType,
+      nodeCount: Array.isArray(p.nodes) ? p.nodes.length : 0,
       hasQuota: p.hasQuota,
       forecast: forecast.text,
       forecastKnown: forecast.known,
@@ -858,7 +920,11 @@ if (typeof module !== "undefined") {
     parseManagedProviders: parseManagedProviders,
     filterProviders: filterProviders,
     providerNodeNames: providerNodeNames,
+    providerNodeRows: providerNodeRows,
+    providerForNode: providerForNode,
     successfulProbeRows: successfulProbeRows,
+    successfulProviderProbeRows: successfulProviderProbeRows,
+    providerPassCount: providerPassCount,
     parseUsageHistory: parseUsageHistory,
     observeUsage: observeUsage,
     quotaForecast: quotaForecast,
